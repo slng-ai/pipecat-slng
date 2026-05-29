@@ -1,17 +1,17 @@
 #
-# Copyright (c) 2024-2026, Daily
+# Copyright (c) 2026, slng.ai
 #
-# SPDX-License-Identifier: BSD 2-Clause License
+# SPDX-License-Identifier: BSD-2-Clause
 #
 
-from pipecat.services.slng.stt import SlngHttpSTTService, SlngSTTService, SlngSTTSettings
-from pipecat.services.slng.tts import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
+"""SLNG WebSocket STT/TTS services for Pipecat."""
+
+from pipecat_slng.stt import SlngSTTService, SlngSTTSettings
+from pipecat_slng.tts import SlngTTSService, SlngTTSSettings
 
 __all__ = [
-    "SlngSTTService",
-    "SlngSTTSettings",
-    "SlngHttpSTTService",
-    "SlngTTSService",
-    "SlngTTSSettings",
-    "SlngHttpTTSService",
+	"SlngSTTService",
+	"SlngSTTSettings",
+	"SlngTTSService",
+	"SlngTTSSettings",
 ]
