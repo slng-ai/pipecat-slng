@@ -11,3 +11,9 @@ wheels/
 
 # Local design docs / plans
 docs/
+
+# Secrets
+.env
+
+# Editor / IDE
+.idea/
