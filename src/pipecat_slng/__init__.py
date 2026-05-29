@@ -10,8 +10,8 @@ from pipecat_slng.stt import SlngSTTService, SlngSTTSettings
 from pipecat_slng.tts import SlngTTSService, SlngTTSSettings
 
 __all__ = [
-	"SlngSTTService",
-	"SlngSTTSettings",
-	"SlngTTSService",
-	"SlngTTSSettings",
+    "SlngSTTService",
+    "SlngSTTSettings",
+    "SlngTTSService",
+    "SlngTTSSettings",
 ]

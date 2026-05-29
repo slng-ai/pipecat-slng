@@ -170,7 +170,9 @@ class SlngTTSService(WebsocketTTSService):
         await super()._connect()
         await self._connect_websocket()
         if self._websocket and not self._receive_task:
-            self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+            self._receive_task = self.create_task(
+                self._receive_task_handler(self._report_error)
+            )
 
     async def _disconnect(self):
         await super()._disconnect()
@@ -227,7 +229,9 @@ class SlngTTSService(WebsocketTTSService):
             if self._world_part_override:
                 headers["X-World-Part-Override"] = self._world_part_override
             self._ready_event.clear()
-            self._websocket = await websocket_connect(ws_url, additional_headers=headers)
+            self._websocket = await websocket_connect(
+                ws_url, additional_headers=headers
+            )
 
             init_msg: dict[str, Any] = {"type": "init", "config": self._build_config()}
             if self._settings.voice:
@@ -237,7 +241,9 @@ class SlngTTSService(WebsocketTTSService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
-            await self.push_error(error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e)
+            await self.push_error(
+                error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e
+            )
 
     async def _disconnect_websocket(self):
         """Send a ``Close`` message and shut down the WebSocket."""
@@ -248,7 +254,9 @@ class SlngTTSService(WebsocketTTSService):
                 await ws.send(json.dumps({"type": "close"}))
                 await ws.close()
         except Exception as e:
-            await self.push_error(error_msg=f"Error closing SLNG TTS websocket: {e}", exception=e)
+            await self.push_error(
+                error_msg=f"Error closing SLNG TTS websocket: {e}", exception=e
+            )
         finally:
             await self.stop_all_metrics()
             await self.remove_active_audio_context()
@@ -346,7 +354,9 @@ class SlngTTSService(WebsocketTTSService):
         elif type_lc == "flushed":
             ctx_id = self.get_active_audio_context_id()
             if ctx_id:
-                await self.append_to_audio_context(ctx_id, TTSStoppedFrame(context_id=ctx_id))
+                await self.append_to_audio_context(
+                    ctx_id, TTSStoppedFrame(context_id=ctx_id)
+                )
                 await self.remove_audio_context(ctx_id)
 
         elif type_lc == "cleared":
@@ -372,7 +382,9 @@ class SlngTTSService(WebsocketTTSService):
             logger.debug(f"{self}: unknown message: {data}")
 
     @traced_tts
-    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+    async def run_tts(
+        self, text: str, context_id: str
+    ) -> AsyncGenerator[Frame | None, None]:
         """Generate speech from text using the SLNG TTS API.
 
         Sends a ``text`` message over the WebSocket. Waits for the server
@@ -399,7 +411,9 @@ class SlngTTSService(WebsocketTTSService):
 
             if not self._ready_event.is_set():
                 try:
-                    await asyncio.wait_for(self._ready_event.wait(), timeout=self._ready_timeout)
+                    await asyncio.wait_for(
+                        self._ready_event.wait(), timeout=self._ready_timeout
+                    )
                 except TimeoutError:
                     logger.warning(f"{self}: init ack timed out, sending Speak anyway")
 

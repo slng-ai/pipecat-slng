@@ -195,13 +195,17 @@ class SlngSTTService(WebsocketSTTService):
             await self._connect()
 
         if self._websocket is None:
-            logger.warning(f"{self}: websocket unavailable after reconnect, dropping audio")
+            logger.warning(
+                f"{self}: websocket unavailable after reconnect, dropping audio"
+            )
             yield None
             return
 
         if not self._ready_event.is_set():
             try:
-                await asyncio.wait_for(self._ready_event.wait(), timeout=self._ready_timeout)
+                await asyncio.wait_for(
+                    self._ready_event.wait(), timeout=self._ready_timeout
+                )
             except TimeoutError:
                 logger.warning(f"{self}: init ack timed out, sending audio anyway")
 
@@ -228,7 +232,9 @@ class SlngSTTService(WebsocketSTTService):
         await self._connect_websocket()
         await super()._connect()
         if self._websocket and not self._receive_task:
-            self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
+            self._receive_task = self.create_task(
+                self._receive_task_handler(self._report_error)
+            )
 
     async def _disconnect(self):
         await super()._disconnect()
@@ -284,7 +290,9 @@ class SlngSTTService(WebsocketSTTService):
                 headers["X-World-Part-Override"] = self._world_part_override
 
             self._ready_event.clear()
-            self._websocket = await websocket_connect(ws_url, additional_headers=headers)
+            self._websocket = await websocket_connect(
+                ws_url, additional_headers=headers
+            )
 
             config = self._build_config()
             await self._websocket.send(json.dumps({"type": "init", "config": config}))
@@ -292,7 +300,9 @@ class SlngSTTService(WebsocketSTTService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
-            await self.push_error(error_msg=f"Unable to connect to SLNG STT: {e}", exception=e)
+            await self.push_error(
+                error_msg=f"Unable to connect to SLNG STT: {e}", exception=e
+            )
 
     async def _disconnect_websocket(self):
         """Send a ``CloseStream`` message and shut down the WebSocket."""
@@ -303,7 +313,9 @@ class SlngSTTService(WebsocketSTTService):
                 await ws.send(json.dumps({"type": "close"}))
                 await ws.close()
         except Exception as e:
-            await self.push_error(error_msg=f"Error closing SLNG STT websocket: {e}", exception=e)
+            await self.push_error(
+                error_msg=f"Error closing SLNG STT websocket: {e}", exception=e
+            )
         finally:
             if self._websocket is ws:
                 self._websocket = None
