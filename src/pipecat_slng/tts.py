@@ -52,6 +52,23 @@ class SlngTTSSettings(TTSSettings):
     speed: float | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
+def _build_tts_config(
+    settings: SlngTTSSettings, encoding: str, sample_rate: int
+) -> dict[str, Any]:
+    """Build the SLNG TTS bridge ``config`` object.
+
+    Shared by the WebSocket and HTTP TTS services so the wire format stays in
+    one place. ``encoding``/``sample_rate`` are always included; ``language``
+    and ``speed`` only when given and not None.
+    """
+    config: dict[str, Any] = {"encoding": encoding, "sample_rate": sample_rate}
+    if is_given(settings.language) and settings.language is not None:
+        config["language"] = str(settings.language)
+    if is_given(settings.speed) and settings.speed is not None:
+        config["speed"] = float(settings.speed)
+    return config
+
+
 class SlngTTSService(WebsocketTTSService):
     """Text-to-speech service using the SLNG Unmute TTS bridge WebSocket API.
 
@@ -190,18 +207,7 @@ class SlngTTSService(WebsocketTTSService):
         Per the Unmute TTS bridge spec, ``voice`` is a top-level field on the
         init message — it is not part of ``config``.
         """
-        config: dict[str, Any] = {
-            "encoding": self._encoding,
-            "sample_rate": self.sample_rate,
-        }
-
-        if is_given(self._settings.language) and self._settings.language is not None:
-            config["language"] = str(self._settings.language)
-
-        if is_given(self._settings.speed) and self._settings.speed is not None:
-            config["speed"] = float(self._settings.speed)
-
-        return config
+        return _build_tts_config(self._settings, self._encoding, self.sample_rate)
 
     async def _connect_websocket(self):
         """Establish the WebSocket connection and send the initial ``init`` message.
@@ -556,18 +562,7 @@ class SlngHttpTTSService(TTSService):
 
     def _build_config(self) -> dict[str, Any]:
         """Build the ``config`` object of the request body."""
-        config: dict[str, Any] = {
-            "encoding": self._encoding,
-            "sample_rate": self.sample_rate,
-        }
-
-        if is_given(self._settings.language) and self._settings.language is not None:
-            config["language"] = str(self._settings.language)
-
-        if is_given(self._settings.speed) and self._settings.speed is not None:
-            config["speed"] = float(self._settings.speed)
-
-        return config
+        return _build_tts_config(self._settings, self._encoding, self.sample_rate)
 
     @traced_tts
     async def run_tts(
