@@ -78,7 +78,10 @@ async def test_live_http_tts_returns_audio():
 
     down, _ = await run_test(
         tts,
-        frames_to_send=[TTSSpeakFrame(text="Hello from SLNG over HTTP."), SleepFrame(sleep=3.0)],
+        frames_to_send=[
+            TTSSpeakFrame(text="Hello from SLNG over HTTP."),
+            SleepFrame(sleep=3.0),
+        ],
     )
 
     assert any(isinstance(f, TTSAudioRawFrame) and f.audio for f in down)
