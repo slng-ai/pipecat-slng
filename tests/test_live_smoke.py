@@ -61,5 +61,7 @@ async def test_live_stt_connects_and_finalizes():
             SleepFrame(sleep=3.0),
         ],
     )
-    # Connecting + handshake without raising is the assertion; transcripts optional.
-    assert all(isinstance(f, TranscriptionFrame) or True for f in down)
+    # Connecting + handshake without raising is the real check (run_test would
+    # have raised on failure). Any transcripts that did arrive must carry text.
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert all(f.text for f in transcripts)

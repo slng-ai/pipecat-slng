@@ -1,7 +1,7 @@
 #
 # Copyright (c) 2026, slng.ai
 #
-# SPDX-License-Identifier: BSD 2-Clause License
+# SPDX-License-Identifier: BSD-2-Clause
 #
 
 """SLNG speech-to-text services."""
