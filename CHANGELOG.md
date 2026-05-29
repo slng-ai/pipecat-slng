@@ -3,6 +3,16 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-05-29
+
+### Added
+- `SlngHttpTTSService` — non-streaming HTTP/REST text-to-speech via the SLNG Unified TTS bridge (`POST /v1/bridges/unmute/tts/{model}`), built on `aiohttp`.
+
+### Changed
+- `SlngTTSService` now applies runtime settings updates: a `voice`/`speed`/`language` change reconnects to re-run the init handshake.
+
+Tested with Pipecat v1.3.0.
+
 ## [0.1.0] - 2026-05-29
 
 ### Added

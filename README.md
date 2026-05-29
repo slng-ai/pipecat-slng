@@ -42,6 +42,27 @@ tts = SlngTTSService(
 )
 ```
 
+## HTTP TTS (non-streaming)
+
+For simple request/response synthesis (no streaming), use `SlngHttpTTSService`.
+It issues one HTTP request per utterance and returns the full audio. Prefer the
+WebSocket `SlngTTSService` for low-latency, interruptible conversations.
+
+```python
+import os
+
+from pipecat_slng import SlngHttpTTSService
+
+tts = SlngHttpTTSService(
+    api_key=os.getenv("SLNG_API_KEY"),
+    model="slng/deepgram/aura:2-en",
+    voice="aura-2-thalia-en",
+)
+```
+
+An `aiohttp.ClientSession` is created internally if you don't pass one; supply
+`aiohttp_session=...` to reuse a shared session.
+
 ## Model variants
 
 | Provider | STT model | TTS model |

@@ -21,7 +21,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_slng import SlngSTTService, SlngTTSService
+from pipecat_slng import SlngHttpTTSService, SlngSTTService, SlngTTSService
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("SLNG_API_KEY"), reason="SLNG_API_KEY not set"
@@ -65,3 +65,23 @@ async def test_live_stt_connects_and_finalizes():
     # have raised on failure). Any transcripts that did arrive must carry text.
     transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
     assert all(f.text for f in transcripts)
+
+
+async def test_live_http_tts_returns_audio():
+    """Real HTTP TTS bridge returns audio for a short utterance."""
+    tts = SlngHttpTTSService(
+        api_key=os.environ["SLNG_API_KEY"],
+        model="slng/deepgram/aura:2-en",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+    )
+
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[
+            TTSSpeakFrame(text="Hello from SLNG over HTTP."),
+            SleepFrame(sleep=3.0),
+        ],
+    )
+
+    assert any(isinstance(f, TTSAudioRawFrame) and f.audio for f in down)

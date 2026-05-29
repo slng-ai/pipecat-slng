@@ -4,15 +4,15 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Unit tests for SlngTTSService using a fake WebSocket."""
+"""Unit tests for SLNG TTS services (WebSocket + HTTP)."""
 
 import asyncio
 import json
 
-from pipecat.frames.frames import TTSAudioRawFrame, TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_slng import SlngTTSService
+from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
 
 
 def _make_tts():
@@ -77,3 +77,142 @@ async def test_binary_audio_becomes_audio_frame(patch_ws):
 
     audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
     assert audio_frames and audio_frames[0].audio == b"\x10\x11" * 100
+
+
+# ---------------------------------------------------------------------------
+# HTTP TTS service
+# ---------------------------------------------------------------------------
+
+
+class FakeResponse:
+    """Minimal stand-in for an aiohttp response."""
+
+    def __init__(self, status=200, body=b"", text=""):
+        self.status = status
+        self._body = body
+        self._text = text
+
+    async def read(self):
+        return self._body
+
+    async def text(self):
+        return self._text
+
+
+class FakeRequestCtx:
+    """Async-context-manager returned by ``FakeAiohttpSession.post``."""
+
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class FakeAiohttpSession:
+    """Records POST calls and returns a canned response."""
+
+    def __init__(self, response):
+        self._response = response
+        self.calls: list = []
+
+    def post(self, url, json=None, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return FakeRequestCtx(self._response)
+
+    async def close(self):
+        pass
+
+
+def _make_http_tts(session):
+    return SlngHttpTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        aiohttp_session=session,
+    )
+
+
+async def test_http_posts_request_and_emits_audio():
+    """HTTP TTS POSTs the right request and emits the returned audio."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x10\x11" * 100))
+    tts = _make_http_tts(session)
+
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi there"), SleepFrame(sleep=0.2)],
+    )
+
+    assert session.calls, "no HTTP request was issued"
+    call = session.calls[0]
+    assert "/v1/bridges/unmute/tts/" in call["url"]
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+    assert call["json"]["text"] == "hi there"
+    assert call["json"]["voice"] == "aura-2-thalia-en"
+    assert call["json"]["config"]["encoding"] == "linear16"
+    assert call["json"]["config"]["sample_rate"] == 24000
+
+    audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
+    assert audio_frames and audio_frames[0].audio == b"\x10\x11" * 100
+
+
+async def test_http_non_200_yields_error_frame():
+    """A non-200 HTTP response yields an ErrorFrame and no audio."""
+    session = FakeAiohttpSession(FakeResponse(status=500, body=b"", text="boom"))
+    tts = _make_http_tts(session)
+
+    down, up = await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    # ErrorFrames are pushed upstream by the pipecat TTSService base class.
+    errors = [f for f in up if isinstance(f, ErrorFrame)]
+    assert errors and "500" in errors[0].error
+    assert not [f for f in down if isinstance(f, TTSAudioRawFrame)]
+
+
+async def test_ws_update_settings_reconnects(monkeypatch):
+    """A changed setting triggers a reconnect so init is re-sent."""
+    tts = _make_tts()
+
+    calls: list = []
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+
+    async def fake_connect():
+        calls.append("connect")
+
+    monkeypatch.setattr(tts, "_disconnect", fake_disconnect)
+    monkeypatch.setattr(tts, "_connect", fake_connect)
+
+    changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-asteria-en"))
+
+    assert "voice" in changed
+    assert calls == ["disconnect", "connect"]
+
+
+async def test_ws_update_settings_noop_does_not_reconnect(monkeypatch):
+    """An unchanged setting does not trigger a reconnect."""
+    tts = _make_tts()
+
+    calls: list = []
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+
+    async def fake_connect():
+        calls.append("connect")
+
+    monkeypatch.setattr(tts, "_disconnect", fake_disconnect)
+    monkeypatch.setattr(tts, "_connect", fake_connect)
+
+    # Same voice as the current setting → no change → no reconnect.
+    changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-thalia-en"))
+
+    assert not changed
+    assert calls == []
