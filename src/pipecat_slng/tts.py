@@ -439,6 +439,27 @@ class SlngTTSService(WebsocketTTSService):
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
 
+    async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
+        """Apply a settings delta and reconnect to re-run the init handshake.
+
+        The TTS bridge takes connection-level config (voice/speed/language) in
+        the ``init`` message, so changed settings only take effect after
+        reconnecting. ``WebsocketTTSService`` has no ``_request_reconnect``, so
+        we disconnect and reconnect explicitly.
+
+        Args:
+            delta: A settings delta to apply.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+        if not changed:
+            return changed
+        await self._disconnect()
+        await self._connect()
+        return changed
+
 
 class SlngHttpTTSService(TTSService):
     """Text-to-speech service using the SLNG Unified TTS bridge HTTP API.

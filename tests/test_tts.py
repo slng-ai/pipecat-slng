@@ -12,7 +12,7 @@ import json
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_slng import SlngHttpTTSService, SlngTTSService
+from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
 
 
 def _make_tts():
@@ -173,3 +173,46 @@ async def test_http_non_200_yields_error_frame():
     errors = [f for f in up if isinstance(f, ErrorFrame)]
     assert errors and "500" in errors[0].error
     assert not [f for f in down if isinstance(f, TTSAudioRawFrame)]
+
+
+async def test_ws_update_settings_reconnects(monkeypatch):
+    """A changed setting triggers a reconnect so init is re-sent."""
+    tts = _make_tts()
+
+    calls: list = []
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+
+    async def fake_connect():
+        calls.append("connect")
+
+    monkeypatch.setattr(tts, "_disconnect", fake_disconnect)
+    monkeypatch.setattr(tts, "_connect", fake_connect)
+
+    changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-asteria-en"))
+
+    assert "voice" in changed
+    assert calls == ["disconnect", "connect"]
+
+
+async def test_ws_update_settings_noop_does_not_reconnect(monkeypatch):
+    """An unchanged setting does not trigger a reconnect."""
+    tts = _make_tts()
+
+    calls: list = []
+
+    async def fake_disconnect():
+        calls.append("disconnect")
+
+    async def fake_connect():
+        calls.append("connect")
+
+    monkeypatch.setattr(tts, "_disconnect", fake_disconnect)
+    monkeypatch.setattr(tts, "_connect", fake_connect)
+
+    # Same voice as the current setting → no change → no reconnect.
+    changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-thalia-en"))
+
+    assert not changed
+    assert calls == []
