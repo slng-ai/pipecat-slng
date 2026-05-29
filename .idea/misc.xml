@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="uv (slng_pipecat_integration)" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="uv (slng_pipecat_integration)" project-jdk-type="Python SDK" />
+</project>
