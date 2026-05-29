@@ -1,32 +1,22 @@
-# Voice AI Backend
+# SLNG Plugin for Pipecat
 
-A backend for building voice agents with **LiveKit** (Agents SDK + Cloud) and **Slang.ai** (`slng.ai`) for STT/TTS.
+Pipecat is an open-source Python framework for building real-time voice and multimodal conversational agents.
 
 ## Documentation
+To fetch documentations, if no default MCPs are provided, use context7.
 
-### LiveKit
-LiveKit evolves quickly — always check the latest docs before implementing.
-
-Use the `lk docs` CLI. Run `lk docs --help` to discover commands, and `lk docs <command> --help` before using a command for the first time.
-
-- `lk docs overview` — start here for any new topic
-- `lk docs get-page` — full pages (best context)
-- `lk docs search` — when you know what to look for
-- `lk docs code-search` — last resort, raw code only
-- `lk docs changelog` — recent changes
-- `lk docs pricing-info` — pricing/plan questions
-
-Prefer browsing (`overview`, `get-page`) over `search`, and `search` over `code-search` — pages give better context than raw code.
+### Pipecat
+Use pipecat-docs MCP server if you need anything from Pipecat Side.
 
 ### Slang.ai
 For STT/TTS models and configuration:
 - General: https://docs.slng.ai/
-- LiveKit plugin: https://docs.slng.ai/agents/livekit-plugin
+- Unified API (What we actually leverage for STT and TTS integrations): https://docs.slng.ai/unified-api/overview
+- Parameter coverage across models: https://docs.slng.ai/unified-api/parameters-coverage
+- Unified STT (ws): https://docs.slng.ai/api-reference/unified-api/unmute-stt-bridge/unmute-stt-bridge-ws
+- Unified TTS (ws): https://docs.slng.ai/api-reference/unified-api/unmute-tts-bridge/unmute-tts-bridge-ws
 
 ## Skills to use
-
-### Primary: voice agent work
-- **`livekit-agents`** — the canonical reference for any voice agent code (workflows, handoffs, tools, sessions). It requires tests for every implementation. Use it whenever touching agent code.
 
 ### Interactions
 - Always use python-dev skill to work with python code and codebase (ALWAYS)
@@ -47,7 +37,6 @@ Run the superpowers workflow in order:
 
 ### Code quality (use during implementation, not as gatekeepers)
 - **`python-dev`** — working with python code and projects, module organization, code style, dependencies, typechecking, linting, formatting.
-- **`python-asyncio-aiohttp`** — async patterns (voice pipelines are async-heavy).
 - **`simplify`** — review changed code for reuse and clarity before finishing.
 
 ### Code review
@@ -55,12 +44,10 @@ Run the superpowers workflow in order:
 - **`superpowers:receiving-code-review`** when responding to review feedback.
 
 ## Codebase exploration
-
 For broad or open-ended searches, dispatch the **Explore** subagent.
 
 ## Conventions
-- Tests are mandatory for voice agent code (enforced by `livekit-agents`).
+- Tests are mandatory for developments and go to live
 - Verify before declaring done — `superpowers:verification-before-completion`.
 - Don't commit API keys; load them from environment variables.
 - Always use docstrings for all functions and classes.
-- Simplicity over complexity — prefer straightforward implementations over complex ones.

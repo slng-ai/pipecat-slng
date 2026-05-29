@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/slng-pipecat-integration.iml" filepath="$PROJECT_DIR$/.idea/slng-pipecat-integration.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/pipecat-slng.iml" filepath="$PROJECT_DIR$/.idea/pipecat-slng.iml" />
     </modules>
   </component>
 </project>

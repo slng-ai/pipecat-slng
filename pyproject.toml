@@ -1,61 +1,53 @@
 [project]
-name = "slng-pipecat-integration"
+name = "pipecat-slng"
 version = "0.1.0"
-description = "SLNG integration to Pipecat"
+description = "SLNG WebSocket STT/TTS services for Pipecat"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "BSD-2-Clause" }
+authors = [{ name = "slng.ai" }]
+keywords = ["pipecat", "slng", "stt", "tts", "voice-ai", "websocket"]
 dependencies = [
-    "pipecat-ai[runner,silero,webrtc]>=1.3.0"
+    "pipecat-ai>=1.3.0",
+    "websockets>=13.0",
 ]
+
+[project.optional-dependencies]
+example = ["pipecat-ai[runner,silero,webrtc,openai]>=1.3.0"]
+
+[project.urls]
+Homepage = "https://slng.ai"
+Repository = "https://github.com/slng-ai/pipecat-slng"
 
 [dependency-groups]
 dev = [
     "ruff>=0.15.14",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_slng"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.ruff]
-exclude = [
-    ".bzr",
-    ".direnv",
-    ".eggs",
-    ".git",
-    ".git-rewrite",
-    ".hg",
-    ".ipynb_checkpoints",
-    ".mypy_cache",
-    ".nox",
-    ".pants.d",
-    ".pyenv",
-    ".pytest_cache",
-    ".pytype",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    ".vscode",
-    "__pypackages__",
-    "_build",
-    "buck-out",
-    "build",
-    "dist",
-    "node_modules",
-    "site-packages",
-    "venv",
-]
-
 line-length = 88
 indent-width = 4
-
-target-version = "py312"
+target-version = "py311"
+exclude = [".venv", "build", "dist"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
 ignore = []
-
 fixable = ["ALL"]
 unfixable = []
-
-# Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.format]
@@ -63,6 +55,3 @@ quote-style = "double"
 indent-style = "tab"
 skip-magic-trailing-comma = false
 line-ending = "auto"
-docstring-code-format = false
-docstring-code-line-length = "dynamic"
-
