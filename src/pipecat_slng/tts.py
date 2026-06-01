@@ -51,7 +51,7 @@ class SlngTTSSettings(TTSSettings):
         speed: Speech speed multiplier. When not given, the server default is used.
     """
 
-    speed: float | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 def _build_tts_config(
@@ -110,8 +110,7 @@ class SlngTTSService(WebsocketTTSService):
             api_key: Authentication key for the SLNG API.
             model: The TTS model to use. Defaults to "slng/deepgram/aura:2-en".
             voice: Voice identifier for synthesis (e.g. "aura-2-thalia-en").
-            base_url: The API host (without scheme) or a full WebSocket URL
-                (e.g. "ws://localhost:8080" for testing). Defaults to "api.slng.ai".
+            base_url: The API host. Defaults to "api.slng.ai".
             encoding: Audio encoding format. One of ``"linear16"``, ``"mp3"``,
                 ``"opus"``, ``"mulaw"``, or ``"alaw"``. Defaults to ``"linear16"``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
@@ -223,7 +222,9 @@ class SlngTTSService(WebsocketTTSService):
             if self._websocket and self._websocket.state is State.OPEN:
                 return
 
-            model = self._settings.model or "slng/deepgram/aura:2-en"
+            model = self._settings.model
+            if not is_given(model) or not model:
+                model = "slng/deepgram/aura:2-en"
             logger.debug(f"Connecting to SLNG TTS ({model})")
 
             model_path = quote(model, safe="/:")
@@ -375,7 +376,8 @@ class SlngTTSService(WebsocketTTSService):
             logger.trace(f"{self}: SLNG TTS audio_end: {data}")
 
         elif type_lc == "error":
-            err = data.get("data") if isinstance(data.get("data"), dict) else {}
+            raw = data.get("data")
+            err = raw if isinstance(raw, dict) else {}
             error_msg = (
                 err.get("message")
                 or data.get("message")
@@ -633,7 +635,9 @@ class SlngHttpTTSService(TTSService):
                     "HTTP session is not initialized; call start() before run_tts()"
                 )
 
-            model = self._settings.model or "slng/deepgram/aura:2-en"
+            model = self._settings.model
+            if not is_given(model) or not model:
+                model = "slng/deepgram/aura:2-en"
             model_path = quote(model, safe="/:")
             url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
 
