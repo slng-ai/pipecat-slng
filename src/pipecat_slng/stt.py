@@ -177,7 +177,7 @@ class SlngSTTService(WebsocketSTTService):
             if self._websocket and self._websocket.state is State.OPEN:
                 await self._websocket.send(json.dumps({"type": "finalize"}))
 
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:  # ty: ignore[invalid-method-override]
         """Process audio data for speech-to-text transcription.
 
         Sends raw PCM audio bytes as a binary WebSocket frame. Waits for the
@@ -276,7 +276,9 @@ class SlngSTTService(WebsocketSTTService):
                 return
             logger.debug(f"Connecting to SLNG STT ({self._settings.model})")
 
-            model = self._settings.model or "slng/deepgram/nova:3-en"
+            model = self._settings.model
+            if not is_given(model) or not model:
+                model = "slng/deepgram/nova:3-en"
             model_path = quote(model, safe="/:")
             if "://" in self._base_url:
                 ws_url = f"{self._base_url}/v1/bridges/unmute/stt/{model_path}"
@@ -367,7 +369,8 @@ class SlngSTTService(WebsocketSTTService):
             logger.trace(f"{self}: SLNG STT utterance_end: {data}")
 
         elif type_lc == "error":
-            err = data.get("data") if isinstance(data.get("data"), dict) else {}
+            raw = data.get("data")
+            err = raw if isinstance(raw, dict) else {}
             error_msg = (
                 err.get("message")
                 or data.get("message")
