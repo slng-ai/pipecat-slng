@@ -63,15 +63,6 @@ tts = SlngHttpTTSService(
 An `aiohttp.ClientSession` is created internally if you don't pass one; supply
 `aiohttp_session=...` to reuse a shared session.
 
-## Model variants
-
-| Provider | STT model | TTS model |
-|----------|-----------|-----------|
-| Deepgram | `slng/deepgram/nova:3-en` | `slng/deepgram/aura:2-en` |
-| ElevenLabs | `slng/elevenlabs/scribe:v1-en` | `slng/elevenlabs/multilingual:v2` |
-| Rime | — | `slng/rime/arcana:v2` |
-| Sarvam | `slng/sarvam/saarika:v2-hi` | `slng/sarvam/bulbul:v2-hi` |
-
 ## Region routing
 
 Both services support gateway region routing via `region_override` (pin to a
@@ -101,14 +92,11 @@ uv run --extra example examples/bot.py
 ```bash
 uv sync --all-extras
 uv run pytest          # unit tests (live smoke tests skip without SLNG_API_KEY)
-uv run ruff check .
+uv run ruff check . 
+uv run ty check .
 ```
 
 ## About SLNG
 
 SLNG (https://slng.ai) is a unified voice AI gateway. Learn more in the
 [SLNG docs](https://docs.slng.ai/).
-
-## License
-
-BSD 2-Clause. See [LICENSE](LICENSE).

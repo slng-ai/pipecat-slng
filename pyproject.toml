@@ -4,7 +4,6 @@ version = "0.2.0"
 description = "SLNG STT/TTS services for Pipecat (WebSocket + HTTP)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "BSD-2-Clause" }
 authors = [{ name = "slng.ai" }]
 keywords = ["pipecat", "slng", "stt", "tts", "voice-ai", "websocket", "http"]
 dependencies = [
