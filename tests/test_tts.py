@@ -7,7 +7,9 @@
 """Unit tests for SLNG TTS services (WebSocket + HTTP)."""
 
 import asyncio
+import io
 import json
+import wave
 
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
 from pipecat.tests.utils import SleepFrame, run_test
@@ -87,10 +89,11 @@ async def test_binary_audio_becomes_audio_frame(patch_ws):
 class FakeResponse:
     """Minimal stand-in for an aiohttp response."""
 
-    def __init__(self, status=200, body=b"", text=""):
+    def __init__(self, status=200, body=b"", text="", content_type="audio/pcm"):
         self.status = status
         self._body = body
         self._text = text
+        self.headers = {"Content-Type": content_type}
 
     async def read(self):
         return self._body
@@ -119,8 +122,10 @@ class FakeAiohttpSession:
         self._response = response
         self.calls: list = []
 
-    def post(self, url, json=None, headers=None):
-        self.calls.append({"url": url, "json": json, "headers": headers})
+    def post(self, url, json=None, headers=None, params=None):
+        self.calls.append(
+            {"url": url, "json": json, "headers": headers, "params": params}
+        )
         return FakeRequestCtx(self._response)
 
     async def close(self):
@@ -134,6 +139,17 @@ def _make_http_tts(session):
         sample_rate=24000,
         aiohttp_session=session,
     )
+
+
+def _make_wav(pcm: bytes, rate: int = 24000) -> bytes:
+    """Wrap raw 16-bit mono PCM in a WAV (RIFF) container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
 
 
 async def test_http_posts_request_and_emits_audio():
@@ -152,11 +168,77 @@ async def test_http_posts_request_and_emits_audio():
     assert call["headers"]["Authorization"] == "Bearer test-key"
     assert call["json"]["text"] == "hi there"
     assert call["json"]["voice"] == "aura-2-thalia-en"
-    assert call["json"]["config"]["encoding"] == "linear16"
-    assert call["json"]["config"]["sample_rate"] == 24000
+    # The HTTP bridge body is {text, voice} only — no `config` object (sending
+    # one makes the bridge reject the payload with a 400).
+    assert "config" not in call["json"]
+    assert call["params"] is None  # no region/world overrides set
 
+    # A non-container response is passed through as raw PCM unchanged.
     audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
     assert audio_frames and audio_frames[0].audio == b"\x10\x11" * 100
+
+
+async def test_http_wav_response_is_decoded():
+    """A WAV (RIFF) response is decoded to raw PCM at the file's sample rate."""
+    pcm = b"\x10\x11" * 100
+    session = FakeAiohttpSession(
+        FakeResponse(
+            status=200, body=_make_wav(pcm, rate=24000), content_type="audio/wav"
+        )
+    )
+    tts = _make_http_tts(session)
+
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
+    assert audio_frames
+    assert audio_frames[0].audio == pcm  # RIFF/WAVE header stripped
+    assert audio_frames[0].sample_rate == 24000
+
+
+async def test_http_region_world_sent_as_query_params():
+    """region/world-part overrides go in the query string, not headers."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = SlngHttpTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        region_override="eu-north-1",
+        world_part_override="eu",
+        aiohttp_session=session,
+    )
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert call["params"] == {"region": "eu-north-1", "world-part": "eu"}
+    assert "X-Region-Override" not in call["headers"]
+    assert "X-World-Part-Override" not in call["headers"]
+
+
+async def test_http_compressed_format_yields_error():
+    """A compressed (e.g. MP3) response is rejected, not emitted as PCM."""
+    session = FakeAiohttpSession(
+        FakeResponse(
+            status=200, body=b"ID3\x04\x00\x00\x00\x00", content_type="audio/mpeg"
+        )
+    )
+    tts = _make_http_tts(session)
+
+    down, up = await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    errors = [f for f in up if isinstance(f, ErrorFrame)]
+    assert errors and "format" in errors[0].error.lower()
+    assert not [f for f in down if isinstance(f, TTSAudioRawFrame)]
 
 
 async def test_http_non_200_yields_error_frame():

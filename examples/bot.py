@@ -9,6 +9,10 @@
 Cascade pipeline: Speech-to-Text → LLM → Text-to-Speech, with SLNG as the
 unified STT and TTS gateway.
 
+TTS defaults to the streaming WebSocket service (``SlngTTSService``); a
+commented-out non-streaming HTTP alternative (``SlngHttpTTSService``) is
+included below — uncomment it (and its import) to switch.
+
 Required services:
 - SLNG (STT + TTS) — set SLNG_API_KEY
 - OpenAI (LLM)      — set OPENAI_API_KEY
@@ -33,43 +37,62 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.runner.types import (
-    DailyRunnerArguments,
-    RunnerArguments,
-    SmallWebRTCRunnerArguments,
-)
+from pipecat.runner.types import DailyRunnerArguments, RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
+from pipecat_slng import SlngSTTService, SlngTTSService, SlngHttpTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-
-from pipecat_slng import SlngSTTService, SlngTTSService
 
 load_dotenv(override=True)
 
 
 async def run_bot(transport: BaseTransport):
-    """Wire up and run the SLNG cascade pipeline."""
+    """Main bot logic."""
     logger.info("Starting bot")
 
+    # Speech-to-Text — swap model= to change provider with no other changes
     stt = SlngSTTService(
         api_key=os.getenv("SLNG_API_KEY"),
         model="slng/deepgram/nova:3-en",
     )
 
-    tts = SlngTTSService(
+    # Text-to-Speech — swap model= and voice= to change provider
+    # Problematic provider
+    # tts = SlngTTSService(
+    #     api_key=os.getenv("SLNG_API_KEY"),
+    #     model="cartesia/sonic:3",
+    #     voice="71a7ad14-091c-4e8e-a314-022ece01c121",
+    # )
+
+    # tts = SlngTTSService(
+    #     api_key=os.getenv("SLNG_API_KEY"),
+    #     model="kugelaudio/kugel:2",
+    #     voice="1071",
+    # )
+
+
+    # tts = SlngTTSService(
+    #     api_key=os.getenv("SLNG_API_KEY"),
+    #     model="slng/deepgram/aura:2-en",
+    #     voice="aura-2-thalia-en",
+    # )
+
+    tts = SlngHttpTTSService(
         api_key=os.getenv("SLNG_API_KEY"),
         model="slng/deepgram/aura:2-en",
         voice="aura-2-thalia-en",
     )
 
+
+    # LLM service
     llm = OpenAIResponsesLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAIResponsesLLMService.Settings(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
             system_instruction=(
                 "You are a helpful assistant in a voice conversation. "
-                "Your responses will be spoken aloud, so avoid emojis, bullet "
-                "points, or other formatting that can't be spoken. Respond to "
-                "what the user said in a creative, helpful, and brief way."
+                "Your responses will be spoken aloud, so avoid emojis, bullet points, "
+                "or other formatting that can't be spoken. "
+                "Respond to what the user said in a creative, helpful, and brief way."
             ),
         ),
     )
@@ -77,7 +100,9 @@ async def run_bot(transport: BaseTransport):
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
     )
 
     pipeline = Pipeline(
@@ -94,7 +119,10 @@ async def run_bot(transport: BaseTransport):
 
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
         observers=[],
     )
 
@@ -117,26 +145,33 @@ async def run_bot(transport: BaseTransport):
 
 
 async def bot(runner_args: RunnerArguments):
-    """Entry point dispatched by the pipecat runner."""
+    """Main bot entry point."""
     transport = None
+
     match runner_args:
         case DailyRunnerArguments():
-            # Imported lazily so the example runs with only the transport
-            # extra you have installed (Daily needs `pipecat-ai[daily]`).
+            # Imported lazily so the bot runs with only the transport extra
+            # you have installed (Daily needs `pipecat-ai[daily]`).
             from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
             transport = DailyTransport(
                 runner_args.room_url,
                 runner_args.token,
-                "Pipecat Bot",
-                params=DailyParams(audio_in_enabled=True, audio_out_enabled=True),
+                "PipecatSLNG Bot",
+                params=DailyParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                ),
             )
         case SmallWebRTCRunnerArguments():
             from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
             transport = SmallWebRTCTransport(
                 webrtc_connection=runner_args.webrtc_connection,
-                params=TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+                params=TransportParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                ),
             )
         case _:
             logger.error(f"Unsupported runner arguments type: {type(runner_args)}")

@@ -7,7 +7,9 @@
 """SLNG text-to-speech service."""
 
 import asyncio
+import io
 import json
+import wave
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
@@ -461,6 +463,32 @@ class SlngTTSService(WebsocketTTSService):
         return changed
 
 
+def _extract_pcm(data: bytes, default_sample_rate: int) -> tuple[int, bytes | None]:
+    """Extract raw PCM and its sample rate from an HTTP TTS response body.
+
+    The SLNG HTTP bridge returns ``audio/*`` without documenting the codec, so
+    the format is detected from the bytes:
+
+    - A WAV/RIFF container is parsed to raw PCM at its embedded sample rate.
+    - Plain PCM (no recognised container or compressed magic) is returned as-is
+      at ``default_sample_rate``.
+    - Compressed formats (MP3/Ogg) return ``(default_sample_rate, None)`` so the
+      caller can surface an error — pipecat needs raw PCM, not an encoded codec.
+    """
+    if not data:
+        return default_sample_rate, b""
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            return wf.getframerate(), wf.readframes(wf.getnframes())
+    if (
+        data[:3] == b"ID3"
+        or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")  # MP3 frame sync
+        or data[:4] == b"OggS"  # Ogg/Opus
+    ):
+        return default_sample_rate, None
+    return default_sample_rate, data
+
+
 class SlngHttpTTSService(TTSService):
     """Text-to-speech service using the SLNG Unified TTS bridge HTTP API.
 
@@ -471,8 +499,11 @@ class SlngHttpTTSService(TTSService):
     :class:`SlngTTSService` for low-latency, interruptible conversational
     audio; use this for simpler batch/non-streaming synthesis.
 
-    With ``encoding="linear16"`` the bridge returns raw PCM, which maps
-    directly onto ``TTSAudioRawFrame`` with no decoding step.
+    The bridge accepts only ``{text, voice}`` in the body and returns
+    ``audio/*`` without a documented codec, so responses are auto-detected: a
+    WAV/RIFF container is decoded to raw PCM at the file's sample rate, and
+    anything else is treated as raw PCM at the pipeline sample rate. Compressed
+    formats (MP3/Ogg) are rejected with an error.
     """
 
     Settings = SlngTTSSettings
@@ -486,7 +517,6 @@ class SlngHttpTTSService(TTSService):
         voice: str | None = None,
         base_url: str = "https://api.slng.ai",
         aiohttp_session: aiohttp.ClientSession | None = None,
-        encoding: str = "linear16",
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
@@ -503,13 +533,13 @@ class SlngHttpTTSService(TTSService):
                 Defaults to "https://api.slng.ai".
             aiohttp_session: Optional aiohttp ClientSession. If None, one is
                 created in ``start()`` and closed in ``stop()``/``cancel()``.
-            encoding: Output audio encoding. ``"linear16"`` yields raw PCM that
-                maps directly to ``TTSAudioRawFrame``. Defaults to ``"linear16"``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline rate.
-            region_override: Pin requests to a specific datacenter. Sets the
-                ``X-Region-Override`` header.
+                Applied to non-container (raw PCM) responses; WAV responses use
+                their own embedded sample rate.
+            region_override: Pin requests to a specific datacenter. Sent as the
+                ``region`` query parameter.
             world_part_override: Constrain routing to a broad geographic zone.
-                Sets the ``X-World-Part-Override`` header.
+                Sent as the ``world-part`` query parameter.
             settings: Runtime-updatable settings override.
             **kwargs: Additional arguments passed to parent TTSService.
         """
@@ -533,7 +563,6 @@ class SlngHttpTTSService(TTSService):
 
         self._api_key = api_key
         self._base_url = base_url
-        self._encoding = encoding
         self._region_override = region_override
         self._world_part_override = world_part_override
         self._session = aiohttp_session
@@ -581,10 +610,6 @@ class SlngHttpTTSService(TTSService):
         await super().cancel(frame)
         await self._close_session()
 
-    def _build_config(self) -> dict[str, Any]:
-        """Build the ``config`` object of the request body."""
-        return _build_tts_config(self._settings, self._encoding, self.sample_rate)
-
     @traced_tts
     async def run_tts(
         self, text: str, context_id: str
@@ -616,17 +641,21 @@ class SlngHttpTTSService(TTSService):
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             }
-            if self._region_override:
-                headers["X-Region-Override"] = self._region_override
-            if self._world_part_override:
-                headers["X-World-Part-Override"] = self._world_part_override
 
-            payload: dict[str, Any] = {"text": text, "config": self._build_config()}
+            # The HTTP bridge body accepts only {text, voice}; region/world-part
+            # are query parameters (the WebSocket service uses headers instead).
+            params: dict[str, str] = {}
+            if self._region_override:
+                params["region"] = self._region_override
+            if self._world_part_override:
+                params["world-part"] = self._world_part_override
+
+            payload: dict[str, Any] = {"text": text}
             if self._settings.voice:
                 payload["voice"] = str(self._settings.voice)
 
             async with self._session.post(
-                url, json=payload, headers=headers
+                url, json=payload, headers=headers, params=params or None
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -634,13 +663,29 @@ class SlngHttpTTSService(TTSService):
                         error=f"SLNG HTTP TTS error (status {response.status}): {error_text}"
                     )
                     return
+                content_type = response.headers.get("Content-Type", "")
                 audio = await response.read()
+
+            sample_rate, pcm = _extract_pcm(audio, self.sample_rate)
+            if pcm is None:
+                logger.error(
+                    f"{self}: unsupported audio format from HTTP bridge "
+                    f"(content-type={content_type!r}, first bytes={audio[:4]!r})"
+                )
+                yield ErrorFrame(
+                    error=(
+                        "SLNG HTTP TTS returned an unsupported audio format "
+                        f"(content-type={content_type!r}); expected raw PCM or WAV. "
+                        "Use the WebSocket SlngTTSService for streaming PCM."
+                    )
+                )
+                return
 
             await self.start_tts_usage_metrics(text)
 
             yield TTSAudioRawFrame(
-                audio=audio,
-                sample_rate=self.sample_rate,
+                audio=pcm,
+                sample_rate=sample_rate,
                 num_channels=1,
                 context_id=context_id,
             )
