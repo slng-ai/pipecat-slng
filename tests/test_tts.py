@@ -132,12 +132,13 @@ class FakeAiohttpSession:
         pass
 
 
-def _make_http_tts(session):
+def _make_http_tts(session, **overrides):
     return SlngHttpTTSService(
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
         aiohttp_session=session,
+        **overrides,
     )
 
 
@@ -202,13 +203,8 @@ async def test_http_wav_response_is_decoded():
 async def test_http_region_world_sent_as_query_params():
     """region/world-part overrides go in the query string, not headers."""
     session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = SlngHttpTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-        region_override="eu-north-1",
-        world_part_override="eu",
-        aiohttp_session=session,
+    tts = _make_http_tts(
+        session, region_override="eu-north-1", world_part_override="eu"
     )
 
     await run_test(

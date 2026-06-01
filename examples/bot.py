@@ -49,9 +49,11 @@ async def run_bot(transport: BaseTransport):
     """Main bot logic."""
     logger.info("Starting bot")
 
+    slng_api_key = os.environ["SLNG_API_KEY"]
+
     # Speech-to-Text — swap model= to change provider with no other changes
     stt = SlngSTTService(
-        api_key=os.getenv("SLNG_API_KEY"),
+        api_key=slng_api_key,
         model="slng/deepgram/nova:3-en",
     )
 
@@ -77,7 +79,7 @@ async def run_bot(transport: BaseTransport):
     # )
 
     tts = SlngHttpTTSService(
-        api_key=os.getenv("SLNG_API_KEY"),
+        api_key=slng_api_key,
         model="slng/deepgram/aura:2-en",
         voice="aura-2-thalia-en",
     )
