@@ -83,6 +83,9 @@ class SlngSTTService(WebsocketSTTService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        enable_vad: bool | _NotGiven = NOT_GIVEN,
+        enable_partials: bool | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -97,14 +100,19 @@ class SlngSTTService(WebsocketSTTService):
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
             region_override: Pin requests to a specific datacenter.
             world_part_override: Constrain routing to a broad geographic zone.
-            settings: Runtime-updatable settings override.
+            language: Recognition language. Defaults to ``Language.EN`` when not given.
+            enable_vad: Enable server-side VAD. Defaults to ``True`` when not given.
+            enable_partials: Stream partial (interim) transcripts. Defaults to
+                ``True`` when not given.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketSTTService.
         """
         default_settings = self.Settings(
             model=model,
-            language=Language.EN,
-            enable_vad=True,
-            enable_partials=True,
+            language=language if is_given(language) else Language.EN,
+            enable_vad=enable_vad if is_given(enable_vad) else True,
+            enable_partials=enable_partials if is_given(enable_partials) else True,
         )
 
         if settings is not None:

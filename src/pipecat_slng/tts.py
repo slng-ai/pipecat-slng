@@ -101,6 +101,8 @@ class SlngTTSService(WebsocketTTSService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -120,14 +122,17 @@ class SlngTTSService(WebsocketTTSService):
             world_part_override: Constrain routing to a broad geographic zone.
                 One of ``"ap"``, ``"eu"``, ``"na"``. Sets the ``X-World-Part-Override``
                 header.
-            settings: Runtime-updatable settings override.
+            language: Synthesis language. Defaults to ``Language.EN`` when not given.
+            speed: Speech speed multiplier. ``None`` (default) keeps the server default.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
         """
         default_settings = self.Settings(
             model=model,
             voice=voice,
-            language=Language.EN,
-            speed=None,
+            language=language if is_given(language) else Language.EN,
+            speed=speed if is_given(speed) else None,
         )
 
         if settings is not None:
@@ -522,6 +527,8 @@ class SlngHttpTTSService(TTSService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -542,14 +549,20 @@ class SlngHttpTTSService(TTSService):
                 ``region`` query parameter.
             world_part_override: Constrain routing to a broad geographic zone.
                 Sent as the ``world-part`` query parameter.
-            settings: Runtime-updatable settings override.
+            language: Kept for API parity with the WebSocket service; the SLNG
+                HTTP bridge body is ``{text, voice}`` only and does NOT accept
+                a ``config`` object, so this value is not sent over the wire.
+            speed: Kept for API parity with the WebSocket service; not sent over
+                the wire for the same reason as ``language``.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent TTSService.
         """
         default_settings = self.Settings(
             model=model,
             voice=voice,
-            language=Language.EN,
-            speed=None,
+            language=language if is_given(language) else Language.EN,
+            speed=speed if is_given(speed) else None,
         )
 
         if settings is not None:
