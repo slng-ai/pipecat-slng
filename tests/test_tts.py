@@ -294,3 +294,68 @@ async def test_ws_update_settings_noop_does_not_reconnect(monkeypatch):
 
     assert not changed
     assert calls == []
+
+
+async def test_ws_region_and_world_headers_sent(patch_ws):
+    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        region_override="ap-southeast-2",
+        world_part_override="ap",
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-Region-Override"] == "ap-southeast-2"
+    assert fake.connect_headers["X-World-Part-Override"] == "ap"
+
+
+async def test_ws_disconnect_sends_close(patch_ws):
+    """On EndFrame the WS-TTS service sends {type: close} before teardown."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "close" for m in text_sends)
+
+
+async def test_flush_audio_sends_flush(patch_ws):
+    """flush_audio() sends {type: flush} to the bridge."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts()
+    tts._websocket = fake
+
+    await tts.flush_audio("ctx-1")
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "flush" for m in text_sends)
+
+
+async def test_interrupt_sends_clear(patch_ws, monkeypatch):
+    """on_audio_context_interrupted sends {type: clear} to the bridge."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts()
+    tts._websocket = fake
+
+    # Stub out base-class machinery that needs full pipeline state.
+    async def _noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(tts, "stop_all_metrics", _noop)
+    # super().on_audio_context_interrupted touches AIService context bookkeeping;
+    # patch it on the parent class so the chain no-ops cleanly.
+    from pipecat.services.tts_service import WebsocketTTSService
+
+    monkeypatch.setattr(
+        WebsocketTTSService, "on_audio_context_interrupted", _noop
+    )
+
+    await tts.on_audio_context_interrupted("ctx-1")
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "clear" for m in text_sends)

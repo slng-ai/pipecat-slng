@@ -66,10 +66,10 @@ T8  | x  | A2 run_tts HTTP push_error before yield ErrorFrame                   
 T9  | x  | A3 deferred-verify STT confidence: live log + apply iff present      | V13,I.STT,I.wire-WS-STT
 T10 | x  | B1 rewrite examples/bot.py WS default, drop commented variants       | V6,I.example
 T11 | x  | B2 README attribution + WS-first restructure + HTTP body doc         | V7,V1,V11,I.readme
-T12 | .  | C1 tests: region/world headers STT + WS-TTS                          | I.STT,I.TTSWS,I.wire-WS-STT,I.wire-WS-TTS
-T13 | .  | C2 tests: on_audio_context_interrupted→clear; flush_audio→flush      | I.TTSWS
-T14 | .  | C3 tests: VAD stop→finalize; from_finalize→confirm_finalize          | I.STT,V3
-T15 | .  | C4 tests: EndFrame/CancelFrame→{type:close} both                     | I.STT,I.TTSWS
+T12 | x  | C1 tests: region/world headers STT + WS-TTS                          | I.STT,I.TTSWS,I.wire-WS-STT,I.wire-WS-TTS
+T13 | x  | C2 tests: on_audio_context_interrupted→clear; flush_audio→flush      | I.TTSWS
+T14 | x  | C3 tests: VAD stop→finalize; from_finalize→confirm_finalize          | I.STT,V3
+T15 | x  | C4 tests: EndFrame/CancelFrame→{type:close} both                     | I.STT,I.TTSWS
 T16 | .  | D1 add src/pipecat_slng/py.typed + wheel verify                      | V8,I.typed,I.pyproject
 T17 | .  | D2 CI workflow: ruff+ty+pytest matrix py3.11/3.12/3.13               | V10,I.ci
 T18 | .  | D3 .gitignore append .claude/, .pytest_cache/, .ruff_cache/          | I.gitignore
