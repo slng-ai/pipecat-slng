@@ -63,7 +63,7 @@ T5  | x  | A2 _connect_websocket WS-TTS raise after push_error                  
 T6  | x  | A2 run_stt push_error before yield ErrorFrame                        | V5,I.STT
 T7  | x  | A2 run_tts WS push_error before yield ErrorFrame                     | V5,I.TTSWS
 T8  | x  | A2 run_tts HTTP push_error before yield ErrorFrame                   | V5,I.TTSHTTP,V11
-T9  | .  | A3 deferred-verify STT confidence: live log + apply iff present      | V13,I.STT,I.wire-WS-STT
+T9  | x  | A3 deferred-verify STT confidence: live log + apply iff present      | V13,I.STT,I.wire-WS-STT
 T10 | .  | B1 rewrite examples/bot.py WS default, drop commented variants       | V6,I.example
 T11 | .  | B2 README attribution + WS-first restructure + HTTP body doc         | V7,V1,V11,I.readme
 T12 | .  | C1 tests: region/world headers STT + WS-TTS                          | I.STT,I.TTSWS,I.wire-WS-STT,I.wire-WS-TTS

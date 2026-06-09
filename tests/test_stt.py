@@ -88,3 +88,31 @@ async def test_audio_sent_as_binary(patch_ws):
     )
 
     assert any(isinstance(s, bytes) and s == audio for s in fake.sent)
+
+
+async def test_low_confidence_transcript_dropped(patch_ws):
+    """A final_transcript with confidence < 0.5 is suppressed (community guide)."""
+    patch_ws(
+        "pipecat_slng.stt",
+        [
+            json.dumps({"type": "ready"}),
+            json.dumps(
+                {"type": "final_transcript", "transcript": "noise", "confidence": 0.3}
+            ),
+            json.dumps(
+                {"type": "final_transcript", "transcript": "real text", "confidence": 0.9}
+            ),
+        ],
+    )
+    stt = _make_stt()
+
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert [t.text for t in transcripts] == ["real text"]

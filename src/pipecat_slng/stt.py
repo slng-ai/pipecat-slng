@@ -409,6 +409,10 @@ class SlngSTTService(WebsocketSTTService):
         fall back to ``channel.alternatives[0].transcript`` because some
         upstream providers (e.g. Deepgram) include the full Deepgram payload
         passed through.
+
+        When the bridge surfaces a top-level ``confidence`` score (optional in
+        the AsyncAPI spec), transcripts below 0.5 are dropped per the Pipecat
+        community-integration guide ("filter for values >50% confidence").
         """
         transcript = (data.get("transcript") or "").strip()
         if not transcript:
@@ -417,6 +421,18 @@ class SlngSTTService(WebsocketSTTService):
             if alternatives:
                 transcript = (alternatives[0].get("transcript") or "").strip()
         if not transcript:
+            return
+
+        confidence = data.get("confidence")
+        if (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and confidence < 0.5
+        ):
+            logger.trace(
+                f"{self}: dropping low-confidence transcript "
+                f"(confidence={confidence:.2f}, transcript={transcript!r})"
+            )
             return
 
         language: Language | None = None
