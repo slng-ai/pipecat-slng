@@ -351,9 +351,7 @@ async def test_interrupt_sends_clear(patch_ws, monkeypatch):
     # patch it on the parent class so the chain no-ops cleanly.
     from pipecat.services.tts_service import WebsocketTTSService
 
-    monkeypatch.setattr(
-        WebsocketTTSService, "on_audio_context_interrupted", _noop
-    )
+    monkeypatch.setattr(WebsocketTTSService, "on_audio_context_interrupted", _noop)
 
     await tts.on_audio_context_interrupted("ctx-1")
 

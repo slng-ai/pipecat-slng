@@ -70,11 +70,11 @@ T12 | x  | C1 tests: region/world headers STT + WS-TTS                          
 T13 | x  | C2 tests: on_audio_context_interrupted→clear; flush_audio→flush      | I.TTSWS
 T14 | x  | C3 tests: VAD stop→finalize; from_finalize→confirm_finalize          | I.STT,V3
 T15 | x  | C4 tests: EndFrame/CancelFrame→{type:close} both                     | I.STT,I.TTSWS
-T16 | .  | D1 add src/pipecat_slng/py.typed + wheel verify                      | V8,I.typed,I.pyproject
-T17 | .  | D2 CI workflow: ruff+ty+pytest matrix py3.11/3.12/3.13               | V10,I.ci
-T18 | .  | D3 .gitignore append .claude/, .pytest_cache/, .ruff_cache/          | I.gitignore
-T19 | .  | D4 pyproject.toml version 0.3.0                                      | V12,I.pyproject
-T20 | .  | D5 CHANGELOG.md [0.3.0] entry                                        | V12,I.changelog
+T16 | x  | D1 add src/pipecat_slng/py.typed + wheel verify                      | V8,I.typed,I.pyproject
+T17 | x  | D2 CI workflow: ruff+ty+pytest matrix py3.11/3.12/3.13               | V10,I.ci
+T18 | x  | D3 .gitignore append .claude/, .pytest_cache/, .ruff_cache/          | I.gitignore
+T19 | x  | D4 pyproject.toml version 0.3.0                                      | V12,I.pyproject
+T20 | x  | D5 CHANGELOG.md [0.3.0] entry                                        | V12,I.changelog
 ```
 
 Status legend: `.` todo | `~` in-progress | `x` done | `!` blocked

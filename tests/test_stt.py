@@ -101,7 +101,11 @@ async def test_low_confidence_transcript_dropped(patch_ws):
                 {"type": "final_transcript", "transcript": "noise", "confidence": 0.3}
             ),
             json.dumps(
-                {"type": "final_transcript", "transcript": "real text", "confidence": 0.9}
+                {
+                    "type": "final_transcript",
+                    "transcript": "real text",
+                    "confidence": 0.9,
+                }
             ),
         ],
     )
@@ -110,7 +114,9 @@ async def test_low_confidence_transcript_dropped(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
             SleepFrame(sleep=0.3),
         ],
     )
@@ -143,7 +149,9 @@ async def test_vad_stop_sends_finalize(patch_ws):
     await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.2),
         ],
@@ -176,7 +184,9 @@ async def test_from_finalize_confirms_finalize(patch_ws, monkeypatch):
     await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1),
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
             SleepFrame(sleep=0.3),
         ],
     )

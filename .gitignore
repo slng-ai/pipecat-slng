@@ -17,3 +17,8 @@ docs/
 
 # Editor / IDE
 .idea/
+.claude/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
