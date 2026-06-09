@@ -256,9 +256,13 @@ class SlngTTSService(WebsocketTTSService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
+            # Community-integration guide (V4): push_error AND raise so the
+            # PipelineRunner surfaces the failure instead of dribbling silent
+            # send-after-disconnect errors.
             await self.push_error(
                 error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e
             )
+            raise
 
     async def _disconnect_websocket(self):
         """Send a ``Close`` message and shut down the WebSocket."""
@@ -422,7 +426,9 @@ class SlngTTSService(WebsocketTTSService):
                 await self._connect()
 
             if not self._websocket:
-                yield ErrorFrame(error="SLNG TTS websocket not connected")
+                error_msg = "SLNG TTS websocket not connected"
+                await self.push_error(error_msg=error_msg)
+                yield ErrorFrame(error=error_msg)
                 return
 
             if not self._ready_event.is_set():
@@ -437,7 +443,9 @@ class SlngTTSService(WebsocketTTSService):
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
-                yield ErrorFrame(error=f"SLNG TTS send error: {e}")
+                error_msg = f"SLNG TTS send error: {e}"
+                await self.push_error(error_msg=error_msg, exception=e)
+                yield ErrorFrame(error=error_msg)
                 yield TTSStoppedFrame(context_id=context_id)
                 await self._disconnect()
                 await self._connect()
@@ -446,7 +454,9 @@ class SlngTTSService(WebsocketTTSService):
             yield None
 
         except Exception as e:
-            yield ErrorFrame(error=f"Unknown error occurred: {e}")
+            error_msg = f"Unknown error occurred: {e}"
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
         """Apply a settings delta and reconnect to re-run the init handshake.
@@ -676,9 +686,11 @@ class SlngHttpTTSService(TTSService):
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    yield ErrorFrame(
-                        error=f"SLNG HTTP TTS error (status {response.status}): {error_text}"
+                    error_msg = (
+                        f"SLNG HTTP TTS error (status {response.status}): {error_text}"
                     )
+                    await self.push_error(error_msg=error_msg)
+                    yield ErrorFrame(error=error_msg)
                     return
                 content_type = response.headers.get("Content-Type", "")
                 audio = await response.read()
@@ -689,13 +701,13 @@ class SlngHttpTTSService(TTSService):
                     f"{self}: unsupported audio format from HTTP bridge "
                     f"(content-type={content_type!r}, first bytes={audio[:4]!r})"
                 )
-                yield ErrorFrame(
-                    error=(
-                        "SLNG HTTP TTS returned an unsupported audio format "
-                        f"(content-type={content_type!r}); expected raw PCM or WAV. "
-                        "Use the WebSocket SlngTTSService for streaming PCM."
-                    )
+                error_msg = (
+                    "SLNG HTTP TTS returned an unsupported audio format "
+                    f"(content-type={content_type!r}); expected raw PCM or WAV. "
+                    "Use the WebSocket SlngTTSService for streaming PCM."
                 )
+                await self.push_error(error_msg=error_msg)
+                yield ErrorFrame(error=error_msg)
                 return
 
             await self.start_tts_usage_metrics(text)
@@ -708,6 +720,8 @@ class SlngHttpTTSService(TTSService):
             )
 
         except Exception as e:
-            yield ErrorFrame(error=f"Unknown error occurred: {e}")
+            error_msg = f"Unknown error occurred: {e}"
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
         finally:
             await self.stop_ttfb_metrics()

@@ -18,6 +18,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
@@ -220,7 +221,11 @@ class SlngSTTService(WebsocketSTTService):
         try:
             await self._websocket.send(audio)
         except Exception as e:
-            logger.warning(f"{self}: send failed: {e}")
+            error_msg = f"SLNG STT send failed: {e}"
+            logger.warning(f"{self}: {error_msg}")
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
+            return
         yield None
 
     async def _send_keepalive(self, silence: bytes):
@@ -310,9 +315,13 @@ class SlngSTTService(WebsocketSTTService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
+            # Community-integration guide (V4): push_error AND raise so the
+            # PipelineRunner surfaces the failure instead of dribbling silent
+            # send-after-disconnect errors.
             await self.push_error(
                 error_msg=f"Unable to connect to SLNG STT: {e}", exception=e
             )
+            raise
 
     async def _disconnect_websocket(self):
         """Send a ``CloseStream`` message and shut down the WebSocket."""
