@@ -1,5 +1,7 @@
 # pipecat-slng
 
+[![CI](https://github.com/slng-ai/pipecat-slng/actions/workflows/ci.yml/badge.svg)](https://github.com/slng-ai/pipecat-slng/actions/workflows/ci.yml)
+
 _Built and maintained by the SLNG team (slng.ai)._
 
 WebSocket STT and TTS services for [Pipecat](https://github.com/pipecat-ai/pipecat),
@@ -21,9 +23,11 @@ pip install pipecat-slng
 ## Environment variables
 
 ```env
-SLNG_API_KEY=your_slng_api_key
-OPENAI_API_KEY=your_openai_api_key
+SLNG_API_KEY=your_slng_api_key      # get one at https://slng.ai
+OPENAI_API_KEY=your_openai_api_key  # only needed for the example bot (LLM)
 ```
+
+Copy [`.env.example`](.env.example) to `.env` to get started.
 
 ## Usage (streaming WebSocket — recommended)
 
@@ -51,6 +55,18 @@ tts = SlngTTSService(
 Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
 `enable_vad=`, `enable_partials=`). For richer overrides pass a
 `SlngSTTSettings(...)` / `SlngTTSSettings(...)` to `settings=`.
+
+Defaults when not specified: STT uses `language=Language.EN`,
+`enable_vad=True`, `enable_partials=True`; TTS uses `language=Language.EN`
+and the server's default `speed`.
+
+Two behaviors worth knowing:
+
+- **Confidence filter (STT).** When the provider surfaces a confidence
+  score, transcripts below 0.5 are dropped.
+- **Runtime settings updates.** Changing `voice`, `speed`, or `language`
+  mid-session (via Pipecat settings updates) reconnects the WebSocket to
+  re-run the init handshake — expect a brief reconnect, not a silent no-op.
 
 ## HTTP TTS (non-streaming fallback)
 
@@ -104,8 +120,13 @@ A complete cascade bot (STT → LLM → TTS, WebSocket TTS by default) lives in
 [`examples/bot.py`](examples/bot.py):
 
 ```bash
+cp .env.example .env   # fill in SLNG_API_KEY and OPENAI_API_KEY
 uv run --extra example examples/bot.py
 ```
+
+Then open http://localhost:7860/client in your browser and start talking.
+The bot uses the SmallWebRTC transport by default; pass `-t daily` to use
+Daily instead (requires installing `pipecat-ai[daily]`).
 
 ## Development
 
@@ -120,3 +141,7 @@ uv run ty check .
 
 SLNG (https://slng.ai) is a unified voice AI gateway. Learn more in the
 [SLNG docs](https://docs.slng.ai/).
+
+## License
+
+BSD-2-Clause — see [LICENSE](LICENSE).

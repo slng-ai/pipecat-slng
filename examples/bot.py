@@ -16,7 +16,12 @@ Required services:
 
 Run with::
 
+    cp .env.example .env   # set SLNG_API_KEY and OPENAI_API_KEY
     uv run --extra example examples/bot.py
+
+Then open http://localhost:7860/client in your browser and start talking.
+Uses the SmallWebRTC transport by default; pass ``-t daily`` to use Daily
+instead (requires ``pipecat-ai[daily]``).
 """
 
 import os
