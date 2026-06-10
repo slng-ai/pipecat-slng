@@ -151,6 +151,10 @@ class SlngTTSService(WebsocketTTSService):
         self._receive_task = None
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
+        # Some upstreams (e.g. rime) close the WebSocket right after
+        # audio_end/flushed; that close is part of the utterance lifecycle,
+        # not a failure (V15).
+        self._expect_server_close = False
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -285,6 +289,30 @@ class SlngTTSService(WebsocketTTSService):
             return self._websocket
         raise Exception("SLNG TTS websocket not connected")
 
+    async def _maybe_try_reconnect(self, error_message, report_error, error=None):
+        """Handle a server-initiated close, distinguishing expected from failure.
+
+        Some upstreams close the WebSocket (code 1000) right after
+        ``audio_end``/``flushed`` — a per-utterance lifecycle, not an error.
+        Reconnect quietly so the close neither logs reconnect warnings nor
+        feeds the base class quick-failure counter (which would otherwise shut
+        the service down after 3 short utterances in a row). Runs inside the
+        receive task, so it must not cancel ``_receive_task`` — hence
+        ``_disconnect_websocket``/``_connect_websocket`` rather than
+        ``_disconnect``/``_connect``. A reconnect failure propagates to the
+        receive handler, which retries via the base machinery with the flag
+        already consumed.
+
+        Unexpected closes (flag unset) keep the full base class behavior.
+        """
+        if self._expect_server_close and not self._disconnecting:
+            self._expect_server_close = False
+            logger.debug(f"{self}: expected per-utterance server close, reconnecting")
+            await self._disconnect_websocket()
+            await self._connect_websocket()
+            return True  # receive loop continues on the new socket
+        return await super()._maybe_try_reconnect(error_message, report_error, error)
+
     async def on_audio_context_interrupted(self, context_id: str):
         """Send a ``Clear`` message to the server when the bot is interrupted.
 
@@ -368,6 +396,7 @@ class SlngTTSService(WebsocketTTSService):
             logger.trace(f"{self}: SLNG TTS metadata: {data}")
 
         elif type_lc == "flushed":
+            self._expect_server_close = True
             ctx_id = self.get_active_audio_context_id()
             if ctx_id:
                 await self.append_to_audio_context(
@@ -380,6 +409,7 @@ class SlngTTSService(WebsocketTTSService):
 
         elif type_lc == "audio_end":
             logger.trace(f"{self}: SLNG TTS audio_end: {data}")
+            self._expect_server_close = True
 
         elif type_lc == "error":
             raw = data.get("data")
@@ -437,6 +467,10 @@ class SlngTTSService(WebsocketTTSService):
                     logger.warning(f"{self}: init ack timed out, sending Speak anyway")
 
             try:
+                # New utterance starting: any stale expected-close flag from a
+                # server that did NOT close after audio_end must not mask a
+                # later real failure (V15).
+                self._expect_server_close = False
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:

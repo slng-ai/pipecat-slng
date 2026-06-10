@@ -3,7 +3,10 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - 2026-06-09
+## [0.3.0] - 2026-06-10
+
+### Fixed
+- `SlngTTSService` now treats a server-initiated WebSocket close after `audio_end`/`flushed` as the expected per-utterance lifecycle (observed with `slng/rime/arcana` models) and reconnects quietly. Previously every bot turn triggered Pipecat reconnect warnings, and three short turns in a row could trip Pipecat's consecutive quick-failure cap and shut the TTS service down mid-call. Unexpected closes keep the full Pipecat retry/failure machinery.
 
 ### Added
 - Top-level constructor kwargs for runtime-tunable settings:

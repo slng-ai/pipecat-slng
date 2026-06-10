@@ -357,3 +357,113 @@ async def test_interrupt_sends_clear(patch_ws, monkeypatch):
 
     text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
     assert any(m.get("type") == "clear" for m in text_sends)
+
+
+# ---------------------------------------------------------------------------
+# V15: server close after audio_end/flushed is expected lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def test_v15_expected_close_reconnects_quietly_three_times(monkeypatch):
+    """Three rapid per-utterance server closes reconnect without error.
+
+    Each connection lives well under pipecat's 5s stability threshold; without
+    the expected-close handling the third close would trip the consecutive
+    quick-failure cap and shut the receive loop down with an ErrorFrame.
+    """
+    from conftest import FakeWebSocket
+
+    fakes: list[FakeWebSocket] = []
+
+    async def _connect(url, **kwargs):
+        fake = FakeWebSocket([json.dumps({"type": "ready"})])
+        fakes.append(fake)
+        return fake
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", _connect)
+    tts = _make_tts()
+
+    async def drive_three_closes():
+        for i in range(3):
+            while len(fakes) < i + 1:
+                await asyncio.sleep(0.01)
+            await fakes[i].feed(json.dumps({"type": "audio_end"}))
+            await fakes[i].close()
+            while len(fakes) < i + 2:
+                await asyncio.sleep(0.01)
+
+    driver = asyncio.create_task(drive_three_closes())
+    try:
+        down, up = await run_test(tts, frames_to_send=[SleepFrame(sleep=1.0)])
+    finally:
+        await asyncio.wait_for(driver, timeout=5)
+
+    # Initial connection + one quiet reconnect per expected close.
+    assert len(fakes) >= 4
+    for fake in fakes:
+        text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+        assert any(m.get("type") == "init" for m in text_sends)
+    assert not [f for f in down if isinstance(f, ErrorFrame)]
+    assert not [f for f in up if isinstance(f, ErrorFrame)]
+
+
+async def test_v15_audio_end_and_flushed_set_expected_close(monkeypatch):
+    """Both completion messages arm the expected-close flag."""
+    tts = _make_tts()
+    monkeypatch.setattr(tts, "get_active_audio_context_id", lambda: None)
+
+    assert tts._expect_server_close is False
+    await tts._process_message({"type": "audio_end"})
+    assert tts._expect_server_close is True
+
+    tts._expect_server_close = False
+    await tts._process_message({"type": "flushed"})
+    assert tts._expect_server_close is True
+
+
+async def test_v15_run_tts_resets_stale_expected_close(patch_ws, monkeypatch):
+    """A new utterance clears a stale flag so it cannot mask a real failure.
+
+    Covers servers that do NOT close after audio_end (e.g. aura): the flag
+    armed by the previous utterance must not survive into the next one.
+    """
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts()
+    tts._websocket = fake
+    tts._ready_event.set()
+
+    async def _noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(tts, "start_tts_usage_metrics", _noop)
+
+    tts._expect_server_close = True
+    async for _ in tts.run_tts("hi", "ctx-1"):
+        pass
+
+    assert tts._expect_server_close is False
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "text" for m in text_sends)
+
+
+async def test_v15_unexpected_close_delegates_to_base(monkeypatch):
+    """With the flag unset, closes keep the full base-class failure handling."""
+    from pipecat.services.websocket_service import WebsocketService
+
+    tts = _make_tts()
+    calls: list = []
+
+    async def fake_base(self, error_message, report_error, error=None):
+        calls.append(error_message)
+        return False
+
+    monkeypatch.setattr(WebsocketService, "_maybe_try_reconnect", fake_base)
+
+    async def _report(frame):
+        pass
+
+    assert tts._expect_server_close is False
+    result = await tts._maybe_try_reconnect("boom", _report)
+
+    assert calls == ["boom"]
+    assert result is False
