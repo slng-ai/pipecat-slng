@@ -18,6 +18,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
     StartFrame,
@@ -32,13 +33,10 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
-try:
-    from websockets.asyncio.client import connect as websocket_connect
-    from websockets.protocol import State
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use SLNG STT, you need to `pip install pipecat-slng`.")
-    raise Exception(f"Missing module: {e}")
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.protocol import State
+
+_DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
 
 
 @dataclass
@@ -77,12 +75,15 @@ class SlngSTTService(WebsocketSTTService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/nova:3-en",
+        model: str = _DEFAULT_STT_MODEL,
         base_url: str = "api.slng.ai",
         encoding: str = "linear16",
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        enable_vad: bool | _NotGiven = NOT_GIVEN,
+        enable_partials: bool | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -97,14 +98,19 @@ class SlngSTTService(WebsocketSTTService):
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
             region_override: Pin requests to a specific datacenter.
             world_part_override: Constrain routing to a broad geographic zone.
-            settings: Runtime-updatable settings override.
+            language: Recognition language. Defaults to ``Language.EN`` when not given.
+            enable_vad: Enable server-side VAD. Defaults to ``True`` when not given.
+            enable_partials: Stream partial (interim) transcripts. Defaults to
+                ``True`` when not given.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketSTTService.
         """
         default_settings = self.Settings(
             model=model,
-            language=Language.EN,
-            enable_vad=True,
-            enable_partials=True,
+            language=language if is_given(language) else Language.EN,
+            enable_vad=enable_vad if is_given(enable_vad) else True,
+            enable_partials=enable_partials if is_given(enable_partials) else True,
         )
 
         if settings is not None:
@@ -212,7 +218,11 @@ class SlngSTTService(WebsocketSTTService):
         try:
             await self._websocket.send(audio)
         except Exception as e:
-            logger.warning(f"{self}: send failed: {e}")
+            error_msg = f"SLNG STT send failed: {e}"
+            logger.warning(f"{self}: {error_msg}")
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
+            return
         yield None
 
     async def _send_keepalive(self, silence: bytes):
@@ -278,7 +288,7 @@ class SlngSTTService(WebsocketSTTService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/nova:3-en"
+                model = _DEFAULT_STT_MODEL
             model_path = quote(model, safe="/:")
             if "://" in self._base_url:
                 ws_url = f"{self._base_url}/v1/bridges/unmute/stt/{model_path}"
@@ -302,9 +312,13 @@ class SlngSTTService(WebsocketSTTService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
+            # Community-integration guide (V4): push_error AND raise so the
+            # PipelineRunner surfaces the failure instead of dribbling silent
+            # send-after-disconnect errors.
             await self.push_error(
                 error_msg=f"Unable to connect to SLNG STT: {e}", exception=e
             )
+            raise
 
     async def _disconnect_websocket(self):
         """Send a ``CloseStream`` message and shut down the WebSocket."""
@@ -392,6 +406,10 @@ class SlngSTTService(WebsocketSTTService):
         fall back to ``channel.alternatives[0].transcript`` because some
         upstream providers (e.g. Deepgram) include the full Deepgram payload
         passed through.
+
+        When the bridge surfaces a top-level ``confidence`` score (optional in
+        the AsyncAPI spec), transcripts below 0.5 are dropped per the Pipecat
+        community-integration guide ("filter for values >50% confidence").
         """
         transcript = (data.get("transcript") or "").strip()
         if not transcript:
@@ -400,6 +418,18 @@ class SlngSTTService(WebsocketSTTService):
             if alternatives:
                 transcript = (alternatives[0].get("transcript") or "").strip()
         if not transcript:
+            return
+
+        confidence = data.get("confidence")
+        if (
+            isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and confidence < 0.5
+        ):
+            logger.trace(
+                f"{self}: dropping low-confidence transcript "
+                f"(confidence={confidence:.2f}, transcript={transcript!r})"
+            )
             return
 
         language: Language | None = None

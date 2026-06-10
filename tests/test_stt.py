@@ -11,6 +11,7 @@ import json
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     TranscriptionFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.tests.utils import SleepFrame, run_test
 
@@ -88,3 +89,117 @@ async def test_audio_sent_as_binary(patch_ws):
     )
 
     assert any(isinstance(s, bytes) and s == audio for s in fake.sent)
+
+
+async def test_low_confidence_transcript_dropped(patch_ws):
+    """A final_transcript with confidence < 0.5 is suppressed (community guide)."""
+    patch_ws(
+        "pipecat_slng.stt",
+        [
+            json.dumps({"type": "ready"}),
+            json.dumps(
+                {"type": "final_transcript", "transcript": "noise", "confidence": 0.3}
+            ),
+            json.dumps(
+                {
+                    "type": "final_transcript",
+                    "transcript": "real text",
+                    "confidence": 0.9,
+                }
+            ),
+        ],
+    )
+    stt = _make_stt()
+
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert [t.text for t in transcripts] == ["real text"]
+
+
+async def test_region_and_world_headers_sent(patch_ws):
+    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = SlngSTTService(
+        api_key="test-key",
+        sample_rate=16000,
+        region_override="eu-north-1",
+        world_part_override="eu",
+    )
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-Region-Override"] == "eu-north-1"
+    assert fake.connect_headers["X-World-Part-Override"] == "eu"
+
+
+async def test_vad_stop_sends_finalize(patch_ws):
+    """VADUserStoppedSpeakingFrame triggers a {type: finalize} send to the bridge."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = _make_stt()
+
+    await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.2),
+        ],
+    )
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "finalize" for m in text_sends)
+
+
+async def test_from_finalize_confirms_finalize(patch_ws, monkeypatch):
+    """A final_transcript with from_finalize=true calls confirm_finalize()."""
+    patch_ws(
+        "pipecat_slng.stt",
+        [
+            json.dumps({"type": "ready"}),
+            json.dumps(
+                {
+                    "type": "final_transcript",
+                    "transcript": "hello",
+                    "from_finalize": True,
+                }
+            ),
+        ],
+    )
+    stt = _make_stt()
+
+    calls: list = []
+    monkeypatch.setattr(stt, "confirm_finalize", lambda: calls.append("confirmed"))
+
+    await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    assert calls == ["confirmed"]
+
+
+async def test_disconnect_sends_close(patch_ws):
+    """On EndFrame the service sends {type: close} before tearing the socket down."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = _make_stt()
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "close" for m in text_sends)

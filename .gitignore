@@ -11,9 +11,16 @@ wheels/
 
 # Local design docs / plans
 docs/
+AGENTS.md
+SPEC.md
 
 # Secrets
 .env
 
 # Editor / IDE
 .idea/
+.claude/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/

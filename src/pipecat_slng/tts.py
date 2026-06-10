@@ -32,13 +32,10 @@ from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
-try:
-    from websockets.asyncio.client import connect as websocket_connect
-    from websockets.protocol import State
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use SLNG TTS, you need to `pip install pipecat-slng`.")
-    raise Exception(f"Missing module: {e}")
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.protocol import State
+
+_DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
 
 @dataclass
@@ -94,13 +91,15 @@ class SlngTTSService(WebsocketTTSService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/aura:2-en",
+        model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
         base_url: str = "api.slng.ai",
         encoding: str = "linear16",
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -120,14 +119,17 @@ class SlngTTSService(WebsocketTTSService):
             world_part_override: Constrain routing to a broad geographic zone.
                 One of ``"ap"``, ``"eu"``, ``"na"``. Sets the ``X-World-Part-Override``
                 header.
-            settings: Runtime-updatable settings override.
+            language: Synthesis language. Defaults to ``Language.EN`` when not given.
+            speed: Speech speed multiplier. ``None`` (default) keeps the server default.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
         """
         default_settings = self.Settings(
             model=model,
             voice=voice,
-            language=Language.EN,
-            speed=None,
+            language=language if is_given(language) else Language.EN,
+            speed=speed if is_given(speed) else None,
         )
 
         if settings is not None:
@@ -224,7 +226,7 @@ class SlngTTSService(WebsocketTTSService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/aura:2-en"
+                model = _DEFAULT_TTS_MODEL
             logger.debug(f"Connecting to SLNG TTS ({model})")
 
             model_path = quote(model, safe="/:")
@@ -251,9 +253,13 @@ class SlngTTSService(WebsocketTTSService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
+            # Community-integration guide (V4): push_error AND raise so the
+            # PipelineRunner surfaces the failure instead of dribbling silent
+            # send-after-disconnect errors.
             await self.push_error(
                 error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e
             )
+            raise
 
     async def _disconnect_websocket(self):
         """Send a ``Close`` message and shut down the WebSocket."""
@@ -417,7 +423,9 @@ class SlngTTSService(WebsocketTTSService):
                 await self._connect()
 
             if not self._websocket:
-                yield ErrorFrame(error="SLNG TTS websocket not connected")
+                error_msg = "SLNG TTS websocket not connected"
+                await self.push_error(error_msg=error_msg)
+                yield ErrorFrame(error=error_msg)
                 return
 
             if not self._ready_event.is_set():
@@ -432,7 +440,9 @@ class SlngTTSService(WebsocketTTSService):
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
-                yield ErrorFrame(error=f"SLNG TTS send error: {e}")
+                error_msg = f"SLNG TTS send error: {e}"
+                await self.push_error(error_msg=error_msg, exception=e)
+                yield ErrorFrame(error=error_msg)
                 yield TTSStoppedFrame(context_id=context_id)
                 await self._disconnect()
                 await self._connect()
@@ -441,7 +451,9 @@ class SlngTTSService(WebsocketTTSService):
             yield None
 
         except Exception as e:
-            yield ErrorFrame(error=f"Unknown error occurred: {e}")
+            error_msg = f"Unknown error occurred: {e}"
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
         """Apply a settings delta and reconnect to re-run the init handshake.
@@ -515,13 +527,15 @@ class SlngHttpTTSService(TTSService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/aura:2-en",
+        model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
         base_url: str = "https://api.slng.ai",
         aiohttp_session: aiohttp.ClientSession | None = None,
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        language: Language | _NotGiven = NOT_GIVEN,
+        speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -542,14 +556,20 @@ class SlngHttpTTSService(TTSService):
                 ``region`` query parameter.
             world_part_override: Constrain routing to a broad geographic zone.
                 Sent as the ``world-part`` query parameter.
-            settings: Runtime-updatable settings override.
+            language: Kept for API parity with the WebSocket service; the SLNG
+                HTTP bridge body is ``{text, voice}`` only and does NOT accept
+                a ``config`` object, so this value is not sent over the wire.
+            speed: Kept for API parity with the WebSocket service; not sent over
+                the wire for the same reason as ``language``.
+            settings: Runtime-updatable settings override. Merged on top of any
+                explicit kwargs above.
             **kwargs: Additional arguments passed to parent TTSService.
         """
         default_settings = self.Settings(
             model=model,
             voice=voice,
-            language=Language.EN,
-            speed=None,
+            language=language if is_given(language) else Language.EN,
+            speed=speed if is_given(speed) else None,
         )
 
         if settings is not None:
@@ -637,7 +657,7 @@ class SlngHttpTTSService(TTSService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/aura:2-en"
+                model = _DEFAULT_TTS_MODEL
             model_path = quote(model, safe="/:")
             url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
 
@@ -663,9 +683,11 @@ class SlngHttpTTSService(TTSService):
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    yield ErrorFrame(
-                        error=f"SLNG HTTP TTS error (status {response.status}): {error_text}"
+                    error_msg = (
+                        f"SLNG HTTP TTS error (status {response.status}): {error_text}"
                     )
+                    await self.push_error(error_msg=error_msg)
+                    yield ErrorFrame(error=error_msg)
                     return
                 content_type = response.headers.get("Content-Type", "")
                 audio = await response.read()
@@ -676,13 +698,13 @@ class SlngHttpTTSService(TTSService):
                     f"{self}: unsupported audio format from HTTP bridge "
                     f"(content-type={content_type!r}, first bytes={audio[:4]!r})"
                 )
-                yield ErrorFrame(
-                    error=(
-                        "SLNG HTTP TTS returned an unsupported audio format "
-                        f"(content-type={content_type!r}); expected raw PCM or WAV. "
-                        "Use the WebSocket SlngTTSService for streaming PCM."
-                    )
+                error_msg = (
+                    "SLNG HTTP TTS returned an unsupported audio format "
+                    f"(content-type={content_type!r}); expected raw PCM or WAV. "
+                    "Use the WebSocket SlngTTSService for streaming PCM."
                 )
+                await self.push_error(error_msg=error_msg)
+                yield ErrorFrame(error=error_msg)
                 return
 
             await self.start_tts_usage_metrics(text)
@@ -695,6 +717,8 @@ class SlngHttpTTSService(TTSService):
             )
 
         except Exception as e:
-            yield ErrorFrame(error=f"Unknown error occurred: {e}")
+            error_msg = f"Unknown error occurred: {e}"
+            await self.push_error(error_msg=error_msg, exception=e)
+            yield ErrorFrame(error=error_msg)
         finally:
             await self.stop_ttfb_metrics()

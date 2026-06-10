@@ -1,5 +1,9 @@
 # pipecat-slng
 
+[![CI](https://github.com/slng-ai/pipecat-slng/actions/workflows/ci.yml/badge.svg)](https://github.com/slng-ai/pipecat-slng/actions/workflows/ci.yml)
+
+_Built and maintained by the SLNG team (slng.ai)._
+
 WebSocket STT and TTS services for [Pipecat](https://github.com/pipecat-ai/pipecat),
 backed by [SLNG](https://slng.ai) — a unified voice AI gateway that routes to
 multiple STT/TTS providers (Deepgram, ElevenLabs, Rime, Sarvam, and more)
@@ -19,11 +23,17 @@ pip install pipecat-slng
 ## Environment variables
 
 ```env
-SLNG_API_KEY=your_slng_api_key
-OPENAI_API_KEY=your_openai_api_key
+SLNG_API_KEY=your_slng_api_key      # get one at https://slng.ai
+OPENAI_API_KEY=your_openai_api_key  # only needed for the example bot (LLM)
 ```
 
-## Usage
+Copy [`.env.example`](.env.example) to `.env` to get started.
+
+## Usage (streaming WebSocket — recommended)
+
+`SlngSTTService` and `SlngTTSService` run over WebSocket: low-latency, supports
+mid-utterance interruption, and exposes the full SLNG config surface
+(encoding, sample_rate, language, speed).
 
 ```python
 import os
@@ -42,11 +52,27 @@ tts = SlngTTSService(
 )
 ```
 
-## HTTP TTS (non-streaming)
+Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
+`enable_vad=`, `enable_partials=`). For richer overrides pass a
+`SlngSTTSettings(...)` / `SlngTTSSettings(...)` to `settings=`.
 
-For simple request/response synthesis (no streaming), use `SlngHttpTTSService`.
-It issues one HTTP request per utterance and returns the full audio. Prefer the
-WebSocket `SlngTTSService` for low-latency, interruptible conversations.
+Defaults when not specified: STT uses `language=Language.EN`,
+`enable_vad=True`, `enable_partials=True`; TTS uses `language=Language.EN`
+and the server's default `speed`.
+
+Two behaviors worth knowing:
+
+- **Confidence filter (STT).** When the provider surfaces a confidence
+  score, transcripts below 0.5 are dropped.
+- **Runtime settings updates.** Changing `voice`, `speed`, or `language`
+  mid-session (via Pipecat settings updates) reconnects the WebSocket to
+  re-run the init handshake — expect a brief reconnect, not a silent no-op.
+
+## HTTP TTS (non-streaming fallback)
+
+For simple request/response synthesis where streaming is not required, use
+`SlngHttpTTSService`. It issues one HTTP POST per utterance and returns the
+full audio body in one frame.
 
 ```python
 import os
@@ -60,6 +86,14 @@ tts = SlngHttpTTSService(
 )
 ```
 
+**HTTP contract limits.** Per the SLNG Unified TTS HTTP OpenAPI, the request
+body accepts **only `{text, voice}`** — there is no `config` object. Encoding,
+sample_rate, language, and speed are therefore **not configurable over HTTP**;
+the server returns its default audio format. The service auto-detects WAV
+(decoded to raw PCM at the file's sample rate) and plain PCM (passed through
+at the pipeline's sample rate). Compressed responses (MP3/Ogg) yield an
+`ErrorFrame` — use the streaming `SlngTTSService` if you need codec control.
+
 An `aiohttp.ClientSession` is created internally if you don't pass one; supply
 `aiohttp_session=...` to reuse a shared session.
 
@@ -68,8 +102,9 @@ An `aiohttp.ClientSession` is created internally if you don't pass one; supply
 Both services support gateway region routing via `region_override` (pin to a
 datacenter: `ap-southeast-2` | `eu-north-1` | `us-east-1`) and
 `world_part_override` (broad zone: `ap` | `eu` | `na`). When both are set,
-`region_override` wins. These map to the `X-Region-Override` and
-`X-World-Part-Override` headers.
+`region_override` wins. WebSocket services send these as the
+`X-Region-Override` / `X-World-Part-Override` headers; the HTTP service uses
+the `region` / `world-part` query parameters (per the bridge contract).
 
 ```python
 stt = SlngSTTService(
@@ -81,18 +116,24 @@ stt = SlngSTTService(
 
 ## Example
 
-A complete cascade bot (STT → LLM → TTS) lives in [`examples/bot.py`](examples/bot.py):
+A complete cascade bot (STT → LLM → TTS, WebSocket TTS by default) lives in
+[`examples/bot.py`](examples/bot.py):
 
 ```bash
+cp .env.example .env   # fill in SLNG_API_KEY and OPENAI_API_KEY
 uv run --extra example examples/bot.py
 ```
+
+Then open http://localhost:7860/client in your browser and start talking.
+The bot uses the SmallWebRTC transport by default; pass `-t daily` to use
+Daily instead (requires installing `pipecat-ai[daily]`).
 
 ## Development
 
 ```bash
 uv sync --all-extras
 uv run pytest          # unit tests (live smoke tests skip without SLNG_API_KEY)
-uv run ruff check . 
+uv run ruff check .
 uv run ty check .
 ```
 
@@ -100,3 +141,7 @@ uv run ty check .
 
 SLNG (https://slng.ai) is a unified voice AI gateway. Learn more in the
 [SLNG docs](https://docs.slng.ai/).
+
+## License
+
+BSD-2-Clause — see [LICENSE](LICENSE).

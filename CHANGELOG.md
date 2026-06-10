@@ -3,6 +3,27 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-09
+
+### Added
+- Top-level constructor kwargs for runtime-tunable settings:
+  - `SlngSTTService`: `language`, `enable_vad`, `enable_partials`
+  - `SlngTTSService`: `language`, `speed`
+  - `SlngHttpTTSService`: `language`, `speed` (kept for parity; not sent over wire — HTTP body is `{text, voice}` only per the SLNG OpenAPI)
+- STT confidence filter: drop transcripts with top-level `confidence < 0.5`, matching the Pipecat community-integration guide. No-op when the bridge does not surface confidence.
+- `py.typed` marker (PEP 561) — downstream type checkers now see inline types.
+- GitHub Actions CI workflow: ruff + ruff-format + ty + pytest matrix on Python 3.11/3.12/3.13.
+- New unit tests covering region/world routing headers, WS-TTS interruption (`clear`/`flush`), STT finalize (`finalize` + `from_finalize`→`confirm_finalize`), and graceful disconnect (`{type: close}`). Suite now 23 unit + 3 live (gated).
+
+### Changed
+- Error handling tightened to the community-integration guide ("raise AND push"):
+  - `_connect_websocket` (STT + WS-TTS) now raises after `push_error`, so connect failures surface through `PipelineRunner` instead of dribbling silent send-after-disconnect errors.
+  - In-stream send / non-200 / compressed-format paths in `run_stt` and `run_tts` (WS + HTTP) now call `push_error` alongside the existing `yield ErrorFrame`.
+- `examples/bot.py` defaults to the streaming `SlngTTSService`; removed the three commented-out TTS variants (incl. the "Problematic provider" Cartesia stub).
+- `README.md` reorganised "WebSocket first, HTTP fallback"; added explicit company attribution under the title; documented the HTTP body contract (`{text, voice}` only).
+
+Tested with Pipecat v1.3.0.
+
 ## [0.2.0] - 2026-05-29
 
 ### Added
