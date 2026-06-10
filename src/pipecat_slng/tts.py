@@ -32,13 +32,10 @@ from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
 
-try:
-    from websockets.asyncio.client import connect as websocket_connect
-    from websockets.protocol import State
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use SLNG TTS, you need to `pip install pipecat-slng`.")
-    raise Exception(f"Missing module: {e}")
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.protocol import State
+
+_DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
 
 @dataclass
@@ -94,7 +91,7 @@ class SlngTTSService(WebsocketTTSService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/aura:2-en",
+        model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
         base_url: str = "api.slng.ai",
         encoding: str = "linear16",
@@ -229,7 +226,7 @@ class SlngTTSService(WebsocketTTSService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/aura:2-en"
+                model = _DEFAULT_TTS_MODEL
             logger.debug(f"Connecting to SLNG TTS ({model})")
 
             model_path = quote(model, safe="/:")
@@ -530,7 +527,7 @@ class SlngHttpTTSService(TTSService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/aura:2-en",
+        model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
         base_url: str = "https://api.slng.ai",
         aiohttp_session: aiohttp.ClientSession | None = None,
@@ -660,7 +657,7 @@ class SlngHttpTTSService(TTSService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/aura:2-en"
+                model = _DEFAULT_TTS_MODEL
             model_path = quote(model, safe="/:")
             url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
 

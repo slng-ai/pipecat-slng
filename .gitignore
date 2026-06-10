@@ -11,6 +11,8 @@ wheels/
 
 # Local design docs / plans
 docs/
+AGENTS.md
+SPEC.md
 
 # Secrets
 .env

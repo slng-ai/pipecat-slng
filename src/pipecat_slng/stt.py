@@ -33,13 +33,10 @@ from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
-try:
-    from websockets.asyncio.client import connect as websocket_connect
-    from websockets.protocol import State
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use SLNG STT, you need to `pip install pipecat-slng`.")
-    raise Exception(f"Missing module: {e}")
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.protocol import State
+
+_DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
 
 
 @dataclass
@@ -78,7 +75,7 @@ class SlngSTTService(WebsocketSTTService):
         self,
         *,
         api_key: str,
-        model: str = "slng/deepgram/nova:3-en",
+        model: str = _DEFAULT_STT_MODEL,
         base_url: str = "api.slng.ai",
         encoding: str = "linear16",
         sample_rate: int | None = None,
@@ -291,7 +288,7 @@ class SlngSTTService(WebsocketSTTService):
 
             model = self._settings.model
             if not is_given(model) or not model:
-                model = "slng/deepgram/nova:3-en"
+                model = _DEFAULT_STT_MODEL
             model_path = quote(model, safe="/:")
             if "://" in self._base_url:
                 ws_url = f"{self._base_url}/v1/bridges/unmute/stt/{model_path}"
