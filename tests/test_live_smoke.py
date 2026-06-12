@@ -67,6 +67,74 @@ async def test_live_stt_connects_and_finalizes():
     assert all(f.text for f in transcripts)
 
 
+byok = pytest.mark.skipif(
+    not os.getenv("DEEPGRAM_API_KEY"), reason="DEEPGRAM_API_KEY not set"
+)
+
+
+@byok
+async def test_live_byok_tts_returns_audio():
+    """BYOK: external route + provider_key returns audio, billed upstream."""
+    tts = SlngTTSService(
+        api_key=os.environ["SLNG_API_KEY"],
+        model="deepgram/aura:2",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        provider_key=os.environ["DEEPGRAM_API_KEY"],
+    )
+
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="Hello from BYOK."), SleepFrame(sleep=3.0)],
+    )
+
+    assert any(isinstance(f, TTSAudioRawFrame) and f.audio for f in down)
+
+
+@byok
+async def test_live_byok_stt_connects_and_finalizes():
+    """BYOK: external STT route + provider_key accepts audio without erroring."""
+    stt = SlngSTTService(
+        api_key=os.environ["SLNG_API_KEY"],
+        model="deepgram/nova:3",
+        sample_rate=16000,
+        provider_key=os.environ["DEEPGRAM_API_KEY"],
+    )
+
+    silence = b"\x00\x00" * 8000
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(audio=silence, sample_rate=16000, num_channels=1),
+            SleepFrame(sleep=3.0),
+        ],
+    )
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert all(f.text for f in transcripts)
+
+
+@byok
+async def test_live_byok_http_tts_returns_audio():
+    """BYOK: external HTTP TTS route + provider_key returns audio."""
+    tts = SlngHttpTTSService(
+        api_key=os.environ["SLNG_API_KEY"],
+        model="deepgram/aura:2",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        provider_key=os.environ["DEEPGRAM_API_KEY"],
+    )
+
+    down, _ = await run_test(
+        tts,
+        frames_to_send=[
+            TTSSpeakFrame(text="Hello from BYOK over HTTP."),
+            SleepFrame(sleep=3.0),
+        ],
+    )
+
+    assert any(isinstance(f, TTSAudioRawFrame) and f.audio for f in down)
+
+
 async def test_live_http_tts_returns_audio():
     """Real HTTP TTS bridge returns audio for a short utterance."""
     tts = SlngHttpTTSService(
