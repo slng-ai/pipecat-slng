@@ -114,6 +114,36 @@ stt = SlngSTTService(
 )
 ```
 
+## Bring your own key (BYOK)
+
+If you already have a contract with an upstream provider, pass your own
+provider key via `provider_key`. It is forwarded as the
+`X-Slng-Provider-Key` header, so the provider bills your account directly
+and no SLNG audio-minute fees apply — while the SLNG cache still applies on
+top. See the [BYOK docs](https://docs.slng.ai/execution-layer/byok).
+
+```python
+stt = SlngSTTService(
+    api_key=os.getenv("SLNG_API_KEY"),
+    model="deepgram/nova:3",            # external route — no slng/ prefix
+    provider_key=os.getenv("DEEPGRAM_API_KEY"),
+)
+
+tts = SlngTTSService(
+    api_key=os.getenv("SLNG_API_KEY"),
+    model="deepgram/aura:2",            # external route — no slng/ prefix
+    voice="aura-2-thalia-en",
+    provider_key=os.getenv("DEEPGRAM_API_KEY"),
+)
+```
+
+BYOK only works on **external** catalog routes (model strings without the
+`slng/` prefix, e.g. `deepgram/aura:2`, `deepgram/nova:3`). SLNG-hosted
+`slng/...` routes reject the header with a 400. If the upstream provider
+rejects your key, the failure surfaces as a `backend_connection_failed`
+error frame over WebSocket, or the upstream 401/403 with the
+`X-Slng-Auth-Source: client_key` response header over HTTP.
+
 ## Example
 
 A complete cascade bot (STT → LLM → TTS, WebSocket TTS by default) lives in
