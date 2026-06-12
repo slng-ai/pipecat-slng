@@ -8,6 +8,7 @@
 
 import json
 
+import pytest
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     TranscriptionFrame,
@@ -163,6 +164,35 @@ async def test_provider_key_header_absent_by_default(patch_ws):
     await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
 
     assert "X-Slng-Provider-Key" not in fake.connect_headers
+
+
+async def test_v19_connect_rejection_includes_server_body(monkeypatch):
+    """A rejected WS upgrade surfaces the server response body, not just the status."""
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    body = b'{"error":"BYOK is only supported for external STT/TTS routes"}'
+    rejection = InvalidStatus(Response(400, "Bad Request", Headers(), body))
+
+    async def _reject(url, **kwargs):
+        raise rejection
+
+    monkeypatch.setattr("pipecat_slng.stt.websocket_connect", _reject)
+    stt = _make_stt()
+
+    pushed: list[str] = []
+
+    async def _record_error(error_msg=None, exception=None):
+        pushed.append(error_msg)
+
+    monkeypatch.setattr(stt, "push_error", _record_error)
+
+    with pytest.raises(InvalidStatus):
+        await stt._connect_websocket()
+
+    assert pushed and "BYOK is only supported" in pushed[0]
+    assert "HTTP 400" in pushed[0]
 
 
 async def test_vad_stop_sends_finalize(patch_ws):

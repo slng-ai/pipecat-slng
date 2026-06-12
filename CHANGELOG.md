@@ -20,6 +20,12 @@ to [Semantic Versioning](https://semver.org/).
 - README "Bring your own key (BYOK)" section with external-route requirement
   and error surfaces.
 
+### Changed
+- WebSocket connect-rejection errors now include the server's response body,
+  not just the HTTP status — e.g. a BYOK request to an `slng/...` route now
+  reports *"HTTP 400 — BYOK is only supported for external STT/TTS routes"*
+  instead of a bare `HTTP 400`.
+
 ## [0.3.0] - 2026-06-10
 
 ### Fixed

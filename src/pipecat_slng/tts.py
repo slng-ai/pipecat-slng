@@ -35,6 +35,8 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._errors import connect_error_detail
+
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
 
@@ -273,7 +275,8 @@ class SlngTTSService(WebsocketTTSService):
             # PipelineRunner surfaces the failure instead of dribbling silent
             # send-after-disconnect errors.
             await self.push_error(
-                error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e
+                error_msg=f"Unable to connect to SLNG TTS: {connect_error_detail(e)}",
+                exception=e,
             )
             raise
 

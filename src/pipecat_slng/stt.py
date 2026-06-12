@@ -36,6 +36,8 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._errors import connect_error_detail
+
 _DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
 
 
@@ -328,7 +330,8 @@ class SlngSTTService(WebsocketSTTService):
             # PipelineRunner surfaces the failure instead of dribbling silent
             # send-after-disconnect errors.
             await self.push_error(
-                error_msg=f"Unable to connect to SLNG STT: {e}", exception=e
+                error_msg=f"Unable to connect to SLNG STT: {connect_error_detail(e)}",
+                exception=e,
             )
             raise
 
