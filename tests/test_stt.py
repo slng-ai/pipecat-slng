@@ -141,6 +141,30 @@ async def test_region_and_world_headers_sent(patch_ws):
     assert fake.connect_headers["X-World-Part-Override"] == "eu"
 
 
+async def test_provider_key_header_sent(patch_ws):
+    """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = SlngSTTService(
+        api_key="test-key",
+        sample_rate=16000,
+        provider_key="my-provider-key",
+    )
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-Slng-Provider-Key"] == "my-provider-key"
+
+
+async def test_provider_key_header_absent_by_default(patch_ws):
+    """Without provider_key the BYOK header is never sent."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = _make_stt()
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert "X-Slng-Provider-Key" not in fake.connect_headers
+
+
 async def test_vad_stop_sends_finalize(patch_ws):
     """VADUserStoppedSpeakingFrame triggers a {type: finalize} send to the bridge."""
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])

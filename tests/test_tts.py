@@ -313,6 +313,59 @@ async def test_ws_region_and_world_headers_sent(patch_ws):
     assert fake.connect_headers["X-World-Part-Override"] == "ap"
 
 
+async def test_ws_provider_key_header_sent(patch_ws):
+    """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        provider_key="my-provider-key",
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-Slng-Provider-Key"] == "my-provider-key"
+
+
+async def test_ws_provider_key_header_absent_by_default(patch_ws):
+    """Without provider_key the BYOK header is never sent."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert "X-Slng-Provider-Key" not in fake.connect_headers
+
+
+async def test_http_provider_key_header_sent():
+    """provider_key maps to the X-Slng-Provider-Key request header (BYOK)."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session, provider_key="my-provider-key")
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert call["headers"]["X-Slng-Provider-Key"] == "my-provider-key"
+
+
+async def test_http_provider_key_header_absent_by_default():
+    """Without provider_key the BYOK header is never sent."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session)
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert "X-Slng-Provider-Key" not in call["headers"]
+
+
 async def test_ws_disconnect_sends_close(patch_ws):
     """On EndFrame the WS-TTS service sends {type: close} before teardown."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
