@@ -3,6 +3,23 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-06-12
+
+### Added
+- BYOK (Bring Your Own Key): new `provider_key` constructor kwarg on
+  `SlngSTTService`, `SlngTTSService`, and `SlngHttpTTSService`. When set, the
+  key is sent as the `X-Slng-Provider-Key` header on the WebSocket upgrade /
+  HTTP request, so the upstream provider bills your account directly and no
+  SLNG audio-minute fees apply. Only valid on external catalog routes (model
+  strings without the `slng/` prefix, e.g. `deepgram/aura:2`,
+  `deepgram/nova:3`); `slng/...` routes reject the header with a 400. Defaults
+  to `None` — no wire change for existing call sites. See
+  [BYOK docs](https://docs.slng.ai/execution-layer/byok).
+- Unit tests asserting the BYOK header is present when `provider_key` is set
+  and absent when it is not, for all three services.
+- README "Bring your own key (BYOK)" section with external-route requirement
+  and error surfaces.
+
 ## [0.3.0] - 2026-06-10
 
 ### Fixed
