@@ -19,6 +19,8 @@ to [Semantic Versioning](https://semver.org/).
   and absent when it is not, for all three services.
 - README "Bring your own key (BYOK)" section with external-route requirement
   and error surfaces.
+- `examples/bot.py` opt-in BYOK: set `SLNG_PROVIDER_KEY` and the example flips
+  to the external `deepgram/nova:3` / `deepgram/aura:2` routes with your key.
 
 ### Changed
 - WebSocket connect-rejection errors now include the server's response body,

@@ -155,6 +155,8 @@ uv run --extra example examples/bot.py
 ```
 
 Then open http://localhost:7860/client in your browser and start talking.
+Set `SLNG_PROVIDER_KEY` (your own Deepgram key) in `.env` to run the example
+in BYOK mode on the external `deepgram/nova:3` / `deepgram/aura:2` routes.
 The bot uses the SmallWebRTC transport by default; pass `-t daily` to use
 Daily instead (requires installing `pipecat-ai[daily]`).
 
