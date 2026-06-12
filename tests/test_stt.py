@@ -183,7 +183,7 @@ async def test_v19_connect_rejection_includes_server_body(monkeypatch):
 
     pushed: list[str] = []
 
-    async def _record_error(error_msg=None, exception=None):
+    async def _record_error(error_msg: str, exception: BaseException | None = None):
         pushed.append(error_msg)
 
     monkeypatch.setattr(stt, "push_error", _record_error)
