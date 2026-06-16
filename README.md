@@ -114,35 +114,53 @@ stt = SlngSTTService(
 )
 ```
 
-## Bring your own key (BYOK)
+## Model routing & bring-your-own-key (BYOK)
 
-If you already have a contract with an upstream provider, pass your own
-provider key via `provider_key`. It is forwarded as the
-`X-Slng-Provider-Key` header, so the provider bills your account directly
-and no SLNG audio-minute fees apply — while the SLNG cache still applies on
-top. See the [BYOK docs](https://docs.slng.ai/execution-layer/byok).
+The `model` string decides where transcription/synthesis runs:
+
+- **`slng/...`** (e.g. `slng/deepgram/aura:2-en`) — hosted by SLNG.
+- **anything else** (e.g. `deepgram/aura:2`, `elevenlabs/...`, `cartesia/sonic:3`,
+  `sarvam/bulbul:v3`) — an **external** provider, proxied through SLNG.
+
+An external route works **with or without** your own provider key — those are
+two independent choices. The `slng/` prefix is what selects SLNG-hosted; BYOK is
+a separate decision layered on top. The full matrix:
+
+| `model` | `provider_key` | Runs on | Billed by |
+|---|---|---|---|
+| `slng/deepgram/aura:2-en` | — | SLNG (self-hosted) | SLNG (audio-minutes) |
+| `deepgram/aura:2` | — | SLNG's own provider account | SLNG (audio-minutes) |
+| `deepgram/aura:2` | your key | **your** provider account | the provider (BYOK) |
+| `slng/...` | your key | — | **rejected — HTTP 400** |
+
+For BYOK, pass your own provider key via `provider_key`. It is forwarded as the
+`X-Slng-Provider-Key` header, so the provider bills your account directly and no
+SLNG audio-minute fees apply — the SLNG cache still applies on top. This is a
+**separate** key from `SLNG_API_KEY`, which always authenticates you to SLNG.
+See the [BYOK docs](https://docs.slng.ai/execution-layer/byok).
 
 ```python
+# BYOK = an external route + your own provider key. Deepgram is shown here; the
+# same pattern works for any external provider (ElevenLabs, Cartesia, Sarvam, …).
 stt = SlngSTTService(
-    api_key=os.getenv("SLNG_API_KEY"),
-    model="deepgram/nova:3",            # external route — no slng/ prefix
-    provider_key=os.getenv("DEEPGRAM_API_KEY"),
+    api_key=os.getenv("SLNG_API_KEY"),            # authenticates you to SLNG
+    model="deepgram/nova:3",                      # external route — no slng/ prefix
+    provider_key=os.getenv("SLNG_PROVIDER_KEY"),  # your own provider key
 )
 
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
-    model="deepgram/aura:2",            # external route — no slng/ prefix
+    model="deepgram/aura:2",                      # external route — no slng/ prefix
     voice="aura-2-thalia-en",
-    provider_key=os.getenv("DEEPGRAM_API_KEY"),
+    provider_key=os.getenv("SLNG_PROVIDER_KEY"),
 )
 ```
 
-BYOK only works on **external** catalog routes (model strings without the
-`slng/` prefix, e.g. `deepgram/aura:2`, `deepgram/nova:3`). SLNG-hosted
-`slng/...` routes reject the header with a 400. If the upstream provider
-rejects your key, the failure surfaces as a `backend_connection_failed`
-error frame over WebSocket, or the upstream 401/403 with the
-`X-Slng-Auth-Source: client_key` response header over HTTP.
+BYOK is valid only on **external** routes; an `slng/...` route plus a
+`provider_key` is rejected with a 400 (*"BYOK is only supported for external
+STT/TTS routes"*). If the provider rejects your key, the failure surfaces as a
+`backend_connection_failed` error frame over WebSocket, or the upstream 401/403
+with the `X-Slng-Auth-Source: client_key` response header over HTTP.
 
 ## Example
 
@@ -155,10 +173,10 @@ uv run --extra example examples/bot.py
 ```
 
 Then open http://localhost:7860/client in your browser and start talking.
-Set `SLNG_PROVIDER_KEY` (your own Deepgram key) in `.env` to run the example
-in BYOK mode on the external `deepgram/nova:3` / `deepgram/aura:2` routes.
-The bot uses the SmallWebRTC transport by default; pass `-t daily` to use
-Daily instead (requires installing `pipecat-ai[daily]`).
+Pick models with `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` (both default to `slng/...`
+self-hosted routes); set `SLNG_PROVIDER_KEY` to your own provider key to run an
+external route in BYOK mode. The bot uses the SmallWebRTC transport by default;
+pass `-t daily` to use Daily instead (requires installing `pipecat-ai[daily]`).
 
 ## Development
 
