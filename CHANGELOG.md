@@ -6,21 +6,29 @@ to [Semantic Versioning](https://semver.org/).
 ## [0.4.0] - 2026-06-12
 
 ### Added
-- BYOK (Bring Your Own Key): new `provider_key` constructor kwarg on
-  `SlngSTTService`, `SlngTTSService`, and `SlngHttpTTSService`. When set, the
-  key is sent as the `X-Slng-Provider-Key` header on the WebSocket upgrade /
-  HTTP request, so the upstream provider bills your account directly and no
-  SLNG audio-minute fees apply. Only valid on external catalog routes (model
-  strings without the `slng/` prefix, e.g. `deepgram/aura:2`,
-  `deepgram/nova:3`); `slng/...` routes reject the header with a 400. Defaults
-  to `None` — no wire change for existing call sites. See
+- BYOK (Bring Your Own Key) and provider-agnostic model routing. A `model`
+  string's `slng/` prefix selects SLNG-hosted; any other route (e.g.
+  `deepgram/aura:2`, `elevenlabs/...`, `cartesia/sonic:3`) is an external
+  provider proxied through SLNG. The three supported routes:
+  - `slng/...` — hosted by SLNG, billed by SLNG.
+  - external route, no key — proxied via SLNG's own provider account, billed
+    by SLNG.
+  - external route + your `provider_key` — proxied with your key; the provider
+    bills you directly (no SLNG audio-minute fees; SLNG cache still applies).
+- New `provider_key` constructor kwarg on `SlngSTTService`, `SlngTTSService`,
+  and `SlngHttpTTSService`. When set, the key is forwarded as the
+  `X-Slng-Provider-Key` header — a key distinct from `SLNG_API_KEY`. Defaults
+  to `None` — no wire change for existing call sites. Valid only on external
+  routes; an `slng/...` route + key is rejected with a 400. See
   [BYOK docs](https://docs.slng.ai/execution-layer/byok).
-- Unit tests asserting the BYOK header is present when `provider_key` is set
-  and absent when it is not, for all three services.
-- README "Bring your own key (BYOK)" section with external-route requirement
-  and error surfaces.
-- `examples/bot.py` opt-in BYOK: set `SLNG_PROVIDER_KEY` and the example flips
-  to the external `deepgram/nova:3` / `deepgram/aura:2` routes with your key.
+- Tests covering all three routes: BYOK header present/absent across the three
+  services, external-route-without-key sends no BYOK header, and live smoke
+  tests for the SLNG-hosted, external-no-key, and BYOK routes.
+- README "Model routing & bring-your-own-key (BYOK)" section with the full
+  route/billing matrix and error surfaces.
+- `examples/bot.py` env-driven routing: `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` /
+  `SLNG_TTS_VOICE` pick the routes (default `slng/...`), and an optional
+  `SLNG_PROVIDER_KEY` enables BYOK on an external route.
 
 ### Changed
 - WebSocket connect-rejection errors now include the server's response body,
