@@ -330,13 +330,31 @@ async def test_ws_provider_key_header_sent(patch_ws):
 
 
 async def test_ws_provider_key_header_absent_by_default(patch_ws):
-    """Without provider_key the BYOK header is never sent."""
+    """Without provider_key the BYOK header is never sent (route 1: default slng/ model)."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = _make_tts()
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
     assert "X-Slng-Provider-Key" not in fake.connect_headers
+
+
+async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
+    """Route 3 (WS TTS): an external model WITHOUT provider_key sends only
+    Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        api_key="test-key",
+        model="deepgram/aura:2",  # external route — no slng/ prefix
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["Authorization"] == "Bearer test-key"
+    assert "X-Slng-Provider-Key" not in fake.connect_headers
+    assert "deepgram/aura:2" in fake.connect_url
 
 
 async def test_http_provider_key_header_sent():
@@ -354,7 +372,7 @@ async def test_http_provider_key_header_sent():
 
 
 async def test_http_provider_key_header_absent_by_default():
-    """Without provider_key the BYOK header is never sent."""
+    """Without provider_key the BYOK header is never sent (route 1: default slng/ model)."""
     session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
     tts = _make_http_tts(session)
 
@@ -365,6 +383,23 @@ async def test_http_provider_key_header_absent_by_default():
 
     call = session.calls[0]
     assert "X-Slng-Provider-Key" not in call["headers"]
+
+
+async def test_http_route3_external_model_no_key_no_byok_header():
+    """Route 3 (HTTP TTS): an external model WITHOUT provider_key sends only
+    Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session, model="deepgram/aura:2")
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+    assert "X-Slng-Provider-Key" not in call["headers"]
+    assert "deepgram/aura:2" in call["url"]
 
 
 async def test_v19_connect_rejection_includes_server_body(monkeypatch):
