@@ -11,6 +11,7 @@ import io
 import json
 import wave
 
+import pytest
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
 from pipecat.tests.utils import SleepFrame, run_test
 
@@ -311,6 +312,123 @@ async def test_ws_region_and_world_headers_sent(patch_ws):
 
     assert fake.connect_headers["X-Region-Override"] == "ap-southeast-2"
     assert fake.connect_headers["X-World-Part-Override"] == "ap"
+
+
+async def test_ws_provider_key_header_sent(patch_ws):
+    """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        provider_key="my-provider-key",
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-Slng-Provider-Key"] == "my-provider-key"
+
+
+async def test_ws_provider_key_header_absent_by_default(patch_ws):
+    """Without provider_key the BYOK header is never sent (route 1: default slng/ model)."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert "X-Slng-Provider-Key" not in fake.connect_headers
+
+
+async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
+    """Route 3 (WS TTS): an external model WITHOUT provider_key sends only
+    Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        api_key="test-key",
+        model="deepgram/aura:2",  # external route — no slng/ prefix
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["Authorization"] == "Bearer test-key"
+    assert "X-Slng-Provider-Key" not in fake.connect_headers
+    assert "deepgram/aura:2" in fake.connect_url
+
+
+async def test_http_provider_key_header_sent():
+    """provider_key maps to the X-Slng-Provider-Key request header (BYOK)."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session, provider_key="my-provider-key")
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert call["headers"]["X-Slng-Provider-Key"] == "my-provider-key"
+
+
+async def test_http_provider_key_header_absent_by_default():
+    """Without provider_key the BYOK header is never sent (route 1: default slng/ model)."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session)
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert "X-Slng-Provider-Key" not in call["headers"]
+
+
+async def test_http_route3_external_model_no_key_no_byok_header():
+    """Route 3 (HTTP TTS): an external model WITHOUT provider_key sends only
+    Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session, model="deepgram/aura:2")
+
+    await run_test(
+        tts,
+        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+    )
+
+    call = session.calls[0]
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+    assert "X-Slng-Provider-Key" not in call["headers"]
+    assert "deepgram/aura:2" in call["url"]
+
+
+async def test_v19_connect_rejection_includes_server_body(monkeypatch):
+    """A rejected WS upgrade surfaces the server response body, not just the status."""
+    from websockets.datastructures import Headers
+    from websockets.exceptions import InvalidStatus
+    from websockets.http11 import Response
+
+    body = b'{"error":"BYOK is only supported for external STT/TTS routes"}'
+    rejection = InvalidStatus(Response(400, "Bad Request", Headers(), body))
+
+    async def _reject(url, **kwargs):
+        raise rejection
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", _reject)
+    tts = _make_tts()
+
+    pushed: list[str] = []
+
+    async def _record_error(error_msg: str, exception: BaseException | None = None):
+        pushed.append(error_msg)
+
+    monkeypatch.setattr(tts, "push_error", _record_error)
+
+    with pytest.raises(InvalidStatus):
+        await tts._connect_websocket()
+
+    assert pushed and "BYOK is only supported" in pushed[0]
+    assert "HTTP 400" in pushed[0]
 
 
 async def test_ws_disconnect_sends_close(patch_ws):

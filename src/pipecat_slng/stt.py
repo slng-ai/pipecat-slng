@@ -36,6 +36,8 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._errors import connect_error_detail
+
 _DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
 
 
@@ -81,6 +83,7 @@ class SlngSTTService(WebsocketSTTService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        provider_key: str | None = None,
         language: Language | _NotGiven = NOT_GIVEN,
         enable_vad: bool | _NotGiven = NOT_GIVEN,
         enable_partials: bool | _NotGiven = NOT_GIVEN,
@@ -98,6 +101,14 @@ class SlngSTTService(WebsocketSTTService):
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
             region_override: Pin requests to a specific datacenter.
             world_part_override: Constrain routing to a broad geographic zone.
+            provider_key: Your own upstream provider API key (BYOK). Sent as the
+                ``X-Slng-Provider-Key`` header on the WebSocket upgrade, so the
+                provider bills your account directly. Only supported on external
+                catalog routes (no ``slng/`` prefix), e.g. ``deepgram/nova:3``;
+                SLNG-hosted ``slng/...`` routes reject it with a 400. A rejected
+                key surfaces as a ``backend_connection_failed`` error frame with
+                the upstream 401/403 detail. See
+                https://docs.slng.ai/execution-layer/byok.
             language: Recognition language. Defaults to ``Language.EN`` when not given.
             enable_vad: Enable server-side VAD. Defaults to ``True`` when not given.
             enable_partials: Stream partial (interim) transcripts. Defaults to
@@ -130,6 +141,7 @@ class SlngSTTService(WebsocketSTTService):
         self._receive_task = None
         self._region_override = region_override
         self._world_part_override = world_part_override
+        self._provider_key = provider_key
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
 
@@ -300,6 +312,8 @@ class SlngSTTService(WebsocketSTTService):
                 headers["X-Region-Override"] = self._region_override
             if self._world_part_override:
                 headers["X-World-Part-Override"] = self._world_part_override
+            if self._provider_key:
+                headers["X-Slng-Provider-Key"] = self._provider_key
 
             self._ready_event.clear()
             self._websocket = await websocket_connect(
@@ -316,7 +330,8 @@ class SlngSTTService(WebsocketSTTService):
             # PipelineRunner surfaces the failure instead of dribbling silent
             # send-after-disconnect errors.
             await self.push_error(
-                error_msg=f"Unable to connect to SLNG STT: {e}", exception=e
+                error_msg=f"Unable to connect to SLNG STT: {connect_error_detail(e)}",
+                exception=e,
             )
             raise
 

@@ -14,6 +14,13 @@ Required services:
 - SLNG (STT + TTS) — set SLNG_API_KEY
 - OpenAI (LLM)      — set OPENAI_API_KEY
 
+Optional:
+- Model routing — set SLNG_STT_MODEL / SLNG_TTS_MODEL (+ SLNG_TTS_VOICE) to
+  pick routes; both default to SLNG-hosted ``slng/...`` routes.
+- BYOK — set SLNG_PROVIDER_KEY to your own provider key. On an external route
+  (a model string without the ``slng/`` prefix) the provider bills you
+  directly. See https://docs.slng.ai/execution-layer/byok
+
 Run with::
 
     cp .env.example .env   # set SLNG_API_KEY and OPENAI_API_KEY
@@ -58,17 +65,31 @@ async def run_bot(transport: BaseTransport):
 
     slng_api_key = os.environ["SLNG_API_KEY"]
 
+    # Model routing is independent of BYOK:
+    #  - slng/... routes are hosted by SLNG (the defaults below).
+    #  - any other route (e.g. deepgram/aura:2) is an external provider proxied
+    #    through SLNG; it runs with OR without your own key.
+    # BYOK (optional): set SLNG_PROVIDER_KEY to your own provider key and the bot
+    # forwards it as X-Slng-Provider-Key, so the provider bills you directly. Only
+    # valid on external routes. https://docs.slng.ai/execution-layer/byok
+    stt_model = os.getenv("SLNG_STT_MODEL", "slng/deepgram/nova:3-en")
+    tts_model = os.getenv("SLNG_TTS_MODEL", "slng/deepgram/aura:2-en")
+    tts_voice = os.getenv("SLNG_TTS_VOICE", "aura-2-thalia-en")
+    provider_key = os.getenv("SLNG_PROVIDER_KEY")
+
     stt = SlngSTTService(
         api_key=slng_api_key,
-        model="slng/deepgram/nova:3-en",
+        model=stt_model,
+        provider_key=provider_key,
     )
 
     # Streaming WebSocket TTS — low latency, supports mid-utterance interruption.
-    # Swap model= to switch provider. For non-streaming HTTP, see SlngHttpTTSService.
+    # Swap SLNG_TTS_MODEL to switch route. For non-streaming HTTP, see SlngHttpTTSService.
     tts = SlngTTSService(
         api_key=slng_api_key,
-        model="slng/deepgram/aura:2-en",
-        voice="aura-2-thalia-en",
+        model=tts_model,
+        voice=tts_voice,
+        provider_key=provider_key,
     )
 
     llm = OpenAIResponsesLLMService(

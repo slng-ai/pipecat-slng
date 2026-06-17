@@ -35,6 +35,8 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._errors import connect_error_detail
+
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
 
@@ -98,6 +100,7 @@ class SlngTTSService(WebsocketTTSService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        provider_key: str | None = None,
         language: Language | _NotGiven = NOT_GIVEN,
         speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
@@ -119,6 +122,14 @@ class SlngTTSService(WebsocketTTSService):
             world_part_override: Constrain routing to a broad geographic zone.
                 One of ``"ap"``, ``"eu"``, ``"na"``. Sets the ``X-World-Part-Override``
                 header.
+            provider_key: Your own upstream provider API key (BYOK). Sent as the
+                ``X-Slng-Provider-Key`` header on the WebSocket upgrade, so the
+                provider bills your account directly. Only supported on external
+                catalog routes (no ``slng/`` prefix), e.g. ``deepgram/aura:2``;
+                SLNG-hosted ``slng/...`` routes reject it with a 400. A rejected
+                key surfaces as a ``backend_connection_failed`` error frame with
+                the upstream 401/403 detail. See
+                https://docs.slng.ai/execution-layer/byok.
             language: Synthesis language. Defaults to ``Language.EN`` when not given.
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
             settings: Runtime-updatable settings override. Merged on top of any
@@ -148,6 +159,7 @@ class SlngTTSService(WebsocketTTSService):
         self._encoding = encoding
         self._region_override = region_override
         self._world_part_override = world_part_override
+        self._provider_key = provider_key
         self._receive_task = None
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
@@ -244,6 +256,8 @@ class SlngTTSService(WebsocketTTSService):
                 headers["X-Region-Override"] = self._region_override
             if self._world_part_override:
                 headers["X-World-Part-Override"] = self._world_part_override
+            if self._provider_key:
+                headers["X-Slng-Provider-Key"] = self._provider_key
             self._ready_event.clear()
             self._websocket = await websocket_connect(
                 ws_url, additional_headers=headers
@@ -261,7 +275,8 @@ class SlngTTSService(WebsocketTTSService):
             # PipelineRunner surfaces the failure instead of dribbling silent
             # send-after-disconnect errors.
             await self.push_error(
-                error_msg=f"Unable to connect to SLNG TTS: {e}", exception=e
+                error_msg=f"Unable to connect to SLNG TTS: {connect_error_detail(e)}",
+                exception=e,
             )
             raise
 
@@ -568,6 +583,7 @@ class SlngHttpTTSService(TTSService):
         sample_rate: int | None = None,
         region_override: str | None = None,
         world_part_override: str | None = None,
+        provider_key: str | None = None,
         language: Language | _NotGiven = NOT_GIVEN,
         speed: float | None | _NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
@@ -590,6 +606,14 @@ class SlngHttpTTSService(TTSService):
                 ``region`` query parameter.
             world_part_override: Constrain routing to a broad geographic zone.
                 Sent as the ``world-part`` query parameter.
+            provider_key: Your own upstream provider API key (BYOK). Sent as the
+                ``X-Slng-Provider-Key`` header on each request, so the provider
+                bills your account directly. Only supported on external catalog
+                routes (no ``slng/`` prefix), e.g. ``deepgram/aura:2``;
+                SLNG-hosted ``slng/...`` routes reject it with a 400. A rejected
+                key returns the upstream 401/403 with the
+                ``X-Slng-Auth-Source: client_key`` response header. See
+                https://docs.slng.ai/execution-layer/byok.
             language: Kept for API parity with the WebSocket service; the SLNG
                 HTTP bridge body is ``{text, voice}`` only and does NOT accept
                 a ``config`` object, so this value is not sent over the wire.
@@ -621,6 +645,7 @@ class SlngHttpTTSService(TTSService):
         self._base_url = base_url
         self._region_override = region_override
         self._world_part_override = world_part_override
+        self._provider_key = provider_key
         self._session = aiohttp_session
         self._owns_session = aiohttp_session is None
 
@@ -699,6 +724,8 @@ class SlngHttpTTSService(TTSService):
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             }
+            if self._provider_key:
+                headers["X-Slng-Provider-Key"] = self._provider_key
 
             # The HTTP bridge body accepts only {text, voice}; region/world-part
             # are query parameters (the WebSocket service uses headers instead).

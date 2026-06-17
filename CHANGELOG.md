@@ -3,6 +3,39 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-06-12
+
+### Added
+- BYOK (Bring Your Own Key) and provider-agnostic model routing. A `model`
+  string's `slng/` prefix selects SLNG-hosted; any other route (e.g.
+  `deepgram/aura:2`, `elevenlabs/...`, `cartesia/sonic:3`) is an external
+  provider proxied through SLNG. The three supported routes:
+  - `slng/...` — hosted by SLNG, billed by SLNG.
+  - external route, no key — proxied via SLNG's own provider account, billed
+    by SLNG.
+  - external route + your `provider_key` — proxied with your key; the provider
+    bills you directly (no SLNG audio-minute fees; SLNG cache still applies).
+- New `provider_key` constructor kwarg on `SlngSTTService`, `SlngTTSService`,
+  and `SlngHttpTTSService`. When set, the key is forwarded as the
+  `X-Slng-Provider-Key` header — a key distinct from `SLNG_API_KEY`. Defaults
+  to `None` — no wire change for existing call sites. Valid only on external
+  routes; an `slng/...` route + key is rejected with a 400. See
+  [BYOK docs](https://docs.slng.ai/execution-layer/byok).
+- Tests covering all three routes: BYOK header present/absent across the three
+  services, external-route-without-key sends no BYOK header, and live smoke
+  tests for the SLNG-hosted, external-no-key, and BYOK routes.
+- README "Model routing & bring-your-own-key (BYOK)" section with the full
+  route/billing matrix and error surfaces.
+- `examples/bot.py` env-driven routing: `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` /
+  `SLNG_TTS_VOICE` pick the routes (default `slng/...`), and an optional
+  `SLNG_PROVIDER_KEY` enables BYOK on an external route.
+
+### Changed
+- WebSocket connect-rejection errors now include the server's response body,
+  not just the HTTP status — e.g. a BYOK request to an `slng/...` route now
+  reports *"HTTP 400 — BYOK is only supported for external STT/TTS routes"*
+  instead of a bare `HTTP 400`.
+
 ## [0.3.0] - 2026-06-10
 
 ### Fixed
