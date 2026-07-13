@@ -48,9 +48,11 @@ class SlngTTSSettings(TTSSettings):
         voice: Voice identifier for speech synthesis.
         language: Language for speech synthesis.
         speed: Speech speed multiplier. When not given, the server default is used.
+        pronunciation: Optional session pronunciation dictionary reference.
     """
 
     speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pronunciation: dict[str, str] | None = None
 
 
 def _build_tts_config(
@@ -67,6 +69,8 @@ def _build_tts_config(
         config["language"] = str(settings.language)
     if is_given(settings.speed) and settings.speed is not None:
         config["speed"] = float(settings.speed)
+    if settings.pronunciation is not None:
+        config["pronunciation"] = settings.pronunciation
     return config
 
 
@@ -103,6 +107,7 @@ class SlngTTSService(WebsocketTTSService):
         provider_key: str | None = None,
         language: Language | _NotGiven = NOT_GIVEN,
         speed: float | None | _NotGiven = NOT_GIVEN,
+        pronunciation: dict[str, str] | None = None,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -132,6 +137,8 @@ class SlngTTSService(WebsocketTTSService):
                 https://docs.slng.ai/execution-layer/byok.
             language: Synthesis language. Defaults to ``Language.EN`` when not given.
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
+            pronunciation: Optional session pronunciation dictionary reference,
+                such as ``{"mode": "rewrite", "name": "support-pronunciations"}``.
             settings: Runtime-updatable settings override. Merged on top of any
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
@@ -141,6 +148,7 @@ class SlngTTSService(WebsocketTTSService):
             voice=voice,
             language=language if is_given(language) else Language.EN,
             speed=speed if is_given(speed) else None,
+            pronunciation=pronunciation,
         )
 
         if settings is not None:

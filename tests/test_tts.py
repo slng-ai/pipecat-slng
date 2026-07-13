@@ -27,7 +27,7 @@ def _make_tts():
 
 
 async def test_init_message_includes_voice(patch_ws):
-    """Init message carries voice at top level and config fields."""
+    """Init carries voice/config fields and omits unset pronunciation."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = _make_tts()
 
@@ -37,6 +37,7 @@ async def test_init_message_includes_voice(patch_ws):
     init = next(m for m in text_sends if m.get("type") == "init")
     assert init["voice"] == "aura-2-thalia-en"
     assert init["config"]["sample_rate"] == 24000
+    assert "pronunciation" not in init["config"]
 
 
 async def test_text_frame_sends_text_message(patch_ws):
