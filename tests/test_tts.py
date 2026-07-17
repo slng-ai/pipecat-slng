@@ -44,7 +44,7 @@ async def test_init_message_includes_voice(patch_ws):
 @pytest.mark.parametrize(
     ("pronunciation", "via_settings"),
     [
-        ({"mode": "rewrite", "name": "support-pronunciations"}, False),
+        ({"mode": "rewrite", "name": "brand-pronunciations"}, False),
         ({"mode": "rewrite", "dictionary_id": "pd_01abc"}, True),
     ],
 )
@@ -285,8 +285,14 @@ async def test_http_non_200_yields_error_frame():
 
 
 async def test_ws_update_settings_reconnects(monkeypatch):
-    """A changed setting triggers a reconnect so init is re-sent."""
-    tts = _make_tts()
+    """A changed setting reconnects without clearing unrelated settings."""
+    pronunciation = {"mode": "rewrite", "name": "brand-pronunciations"}
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        pronunciation=pronunciation,
+    )
 
     calls: list = []
 
@@ -302,6 +308,8 @@ async def test_ws_update_settings_reconnects(monkeypatch):
     changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-asteria-en"))
 
     assert "voice" in changed
+    assert "pronunciation" not in changed
+    assert tts._settings.pronunciation == pronunciation
     assert calls == ["disconnect", "connect"]
 
 

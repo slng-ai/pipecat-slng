@@ -52,7 +52,9 @@ class SlngTTSSettings(TTSSettings):
     """
 
     speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pronunciation: dict[str, str] | None = None
+    pronunciation: dict[str, str] | None | _NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
 
 
 def _build_tts_config(
@@ -69,7 +71,7 @@ def _build_tts_config(
         config["language"] = str(settings.language)
     if is_given(settings.speed) and settings.speed is not None:
         config["speed"] = float(settings.speed)
-    if settings.pronunciation is not None:
+    if is_given(settings.pronunciation) and settings.pronunciation is not None:
         config["pronunciation"] = settings.pronunciation
     return config
 
