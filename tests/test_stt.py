@@ -13,6 +13,7 @@ import pytest
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -342,3 +343,32 @@ async def test_disconnect_sends_close(patch_ws):
 
     text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
     assert any(m.get("type") == "close" for m in text_sends)
+
+
+async def test_interruption_clears_pending_finalize(patch_ws):
+    """An interruption must not leave a finalize outstanding.
+
+    The base class clears the handshake only on VAD start
+    (stt_service.py:594-595), but InterruptionFrame is emitted from an
+    InterruptionWorkerFrame with no VAD coupling. Without this, an unanswered
+    finalize outlives its turn and marks an unrelated later final as finalized,
+    ending that turn early.
+    """
+    patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = _make_stt()
+
+    await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.1),
+            InterruptionFrame(),
+            SleepFrame(sleep=0.1),
+        ],
+    )
+
+    assert stt._finalize_requested is False
+    assert stt._finalize_pending is False

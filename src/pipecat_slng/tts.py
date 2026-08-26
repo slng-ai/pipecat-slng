@@ -245,6 +245,18 @@ class SlngTTSService(WebsocketTTSService):
         ``WebsocketTTSService`` has no keepalive machinery of its own (unlike
         ``WebsocketSTTService``, which inherits it from ``STTService``), so this
         mirrors the local task other Pipecat TTS services use.
+
+        A send failure must NOT break the loop. The per-utterance reconnect in
+        ``_maybe_try_reconnect`` swaps the socket via
+        ``_disconnect_websocket``/``_connect_websocket`` and never touches this
+        task, and a completed task is truthy — so ``_connect``'s
+        ``not self._keepalive_task`` guard would never recreate it. Breaking here
+        would silently kill the keepalive for the rest of the session after one
+        transient error, which is the idle close this exists to prevent. The
+        base class hits the same hazard and solves it by restarting the task
+        (``stt_service.py`` ``_reconnect_websocket``); continuing is smaller and
+        needs no restart path. The open-state check below makes a dead socket
+        cost one no-op wakeup per interval.
         """
         while True:
             await asyncio.sleep(_KEEPALIVE_INTERVAL)
@@ -254,7 +266,6 @@ class SlngTTSService(WebsocketTTSService):
                 await self._websocket.send(json.dumps({"type": "keepalive"}))
             except Exception as e:
                 logger.warning(f"{self}: keepalive send failed: {e}")
-                break
 
     def _build_config(self) -> dict[str, Any]:
         """Build the inner ``config`` object of the init message.
@@ -358,9 +369,11 @@ class SlngTTSService(WebsocketTTSService):
         """
         if self._expect_server_close and not self._disconnecting:
             self._expect_server_close = False
+            armed_by = self._expect_server_close_reason
+            self._expect_server_close_reason = None
             logger.debug(
                 f"{self}: expected per-utterance server close "
-                f"(armed by {self._expect_server_close_reason}), reconnecting"
+                f"(armed by {armed_by}), reconnecting"
             )
             await self._disconnect_websocket()
             await self._connect_websocket()

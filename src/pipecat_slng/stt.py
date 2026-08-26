@@ -21,6 +21,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
+    InterruptionFrame,
     StartFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -195,6 +196,14 @@ class SlngSTTService(WebsocketSTTService):
             if self._websocket and self._websocket.state is State.OPEN:
                 self.request_finalize()
                 await self._websocket.send(json.dumps({"type": "finalize"}))
+        elif isinstance(frame, InterruptionFrame):
+            # The base class clears the finalize handshake only on VAD start
+            # (stt_service.py:594-595); InterruptionFrame is emitted from an
+            # InterruptionWorkerFrame with no VAD coupling, so an unanswered
+            # finalize can outlive the turn that requested it and mark an
+            # unrelated later final as finalized — ending that turn early.
+            self._finalize_requested = False
+            self._finalize_pending = False
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:  # ty: ignore[invalid-method-override]
         """Process audio data for speech-to-text transcription.
