@@ -27,8 +27,13 @@ to [Semantic Versioning](https://semver.org/).
   of it.
 
   Both `TurnAnalyzerUserTurnStopStrategy` and `SpeechTimeoutUserTurnStopStrategy` now
-  short-circuit that timer. If you tuned `stop_secs`, `user_turn_stop_timeout`, or an
-  `endpointing_delay` to compensate for the old fixed second, re-check those values.
+  short-circuit that timer. Measured against the live bridge at `stop_secs=0.2`, turn-end
+  moves from a flat **1004 ms** after end of speech (10/10 runs within 2 ms, on both
+  routes, regardless of how fast the bridge replied) to tracking the transcript:
+  **605 ms** on `slng/deepgram/nova:3-en` and **281 ms** on `deepgram/nova:3` — a saving
+  of ~400 ms and ~723 ms respectively. If you tuned `stop_secs`,
+  `user_turn_stop_timeout`, or an `endpointing_delay` to compensate for the old fixed
+  second, re-check those values.
 
 - **Low-confidence final transcripts are no longer dropped.** The `confidence < 0.5`
   filter applied to finals as well as partials. Dropping a final does not lose a word —
@@ -51,16 +56,21 @@ to [Semantic Versioning](https://semver.org/).
 
 Recorded so the reasoning is not re-derived. None of these ship in this release.
 
-- **A measured `ttfs_p99_latency` constant.** No code is needed — the kwarg already
-  reaches the base class, so `SlngSTTService(..., ttfs_p99_latency=0.42)` works today
-  and is the supported way to right-size the residual timer per deployment. Only the
-  measured default is missing. `stt-benchmark` supports a fixed built-in service
-  registry that does not include this package, so measuring it needs a registry entry
-  upstream in addition to live credentials. Measure at `VADParams.stop_secs=0.2` (the
-  threshold every built-in value assumes) and report the SLNG-hosted and proxied
-  routes separately. Until then the "ttfs_p99_latency not set" warning at pipeline
-  start persists; it is cosmetic, since a finalized transcript now cancels the timer
-  it sizes.
+- **A default `ttfs_p99_latency` constant.** No code is needed — the kwarg already
+  reaches the base class, so `SlngSTTService(..., ttfs_p99_latency=0.7)` works today and
+  is the supported way to right-size the residual timer per deployment. Only the default
+  is unset, so Pipecat still substitutes 1.0 s and warns at pipeline start; that warning
+  is now cosmetic, since a finalized transcript cancels the timer it sizes.
+
+  The span *was* measured at `stop_secs=0.2`: **605 ms median** (597–659, n=16) on
+  `slng/deepgram/nova:3-en` and **280 ms median** (273–338, n=13) on `deepgram/nova:3`.
+  **The two routes differ by 2.2×**, so a single default cannot suit both — surfacing
+  that rather than choosing, since which route to standardise on is a separate decision.
+  These figures are also not interchangeable with Pipecat's built-in table, which is P99
+  over 1000 `stt-benchmark` samples; a P99 over 16 samples is not a P99, and
+  `stt-benchmark` only accepts services in its built-in registry, which excludes this
+  package. `0.7` would cover both observed maxima and beat the current 1.0 s fallback if
+  a default is wanted before then.
 - **A warm standby TTS socket (`warm_standby_enabled`).** Not implemented; a consumer
   passing the kwarg still has it absorbed by `**kwargs` with no effect. Whether it is
   worth building depends on whether any route actually closes after `flushed`. The
@@ -69,8 +79,8 @@ Recorded so the reasoning is not re-derived. None of these ship in this release.
 - **`utterance_end` as a finalization signal.** The bridge scopes it to models whose
   catalog declares a `tokenStream` with `finalMarkers` (its documented examples are
   Soniox `<end>`/`<fin>` tokens); the `deepgram/nova` routes in use are not such
-  models, and its only payload field is a timestamp, so it carries no transcript.
-  Left logged at trace level.
+  models, and its only payload field is a timestamp, so it carries no transcript. Never
+  observed on either route across 29 live runs. Left logged at trace level.
 - **A `mulaw`/8000 Hz phone leg.** Only half available: the STT bridge accepts
   `linear16`, `mp3`, and `opus` — **not** `mulaw` — though it does accept 8000 Hz. The
   TTS bridge does list `mulaw`. Not pursued without a phone-leg measurement.

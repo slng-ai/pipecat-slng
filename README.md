@@ -69,14 +69,20 @@ Three behaviors worth knowing:
   sends `finalize` and marks the answering transcript
   `TranscriptionFrame.finalized`, which is what lets Pipecat end the user turn
   immediately instead of waiting out its safety-net timer. That timer is sized
-  by `ttfs_p99_latency`, which this service does not yet declare a measured
-  default for, so Pipecat substitutes a conservative 1.0 s and logs a warning at
-  pipeline start. You can pass your own measured value —
-  `SlngSTTService(..., ttfs_p99_latency=0.42)` — measured with
+  by `ttfs_p99_latency`, for which this service declares no default, so Pipecat
+  substitutes a conservative 1.0 s and logs a warning at pipeline start. It only
+  affects the fallback path — a finalized transcript cancels the timer before it
+  fires — so the warning is cosmetic.
+
+  To right-size the fallback, pass your own value:
+  `SlngSTTService(..., ttfs_p99_latency=<seconds>)`. Measure it with
   [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) at
   `VADParams.stop_secs=0.2`, the threshold Pipecat's built-in values assume.
-  It only affects the fallback path, since a finalized transcript cancels the
-  timer before it fires.
+  Indicative figures from our own harness (speech-end → final transcript, small
+  sample, one network path — **not** a substitute for a benchmarked P99):
+  ~605 ms median on `slng/deepgram/nova:3-en` and ~280 ms on `deepgram/nova:3`.
+  Prefer a value above your observed maximum: too low expires the safety net
+  early and cuts the caller off, which is worse than waiting.
 - **Runtime settings updates.** Changing `voice`, `speed`, or `language`
   mid-session (via Pipecat settings updates) reconnects the WebSocket to
   re-run the init handshake — expect a brief reconnect, not a silent no-op.
