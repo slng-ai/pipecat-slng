@@ -24,3 +24,7 @@ SPEC.md
 # Tool caches
 .pytest_cache/
 .ruff_cache/
+
+# Spec Kit (local specs/plans — never committed)
+.specify/
+specs/
