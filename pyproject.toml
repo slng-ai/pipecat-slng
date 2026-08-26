@@ -44,6 +44,9 @@ packages = ["src/pipecat_slng"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: touches the real SLNG bridge; needs SLNG_API_KEY and network",
+]
 
 [tool.ruff]
 line-length = 88

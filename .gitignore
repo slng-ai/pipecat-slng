@@ -25,3 +25,7 @@ SPEC.md
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# Spec Kit (local specs/plans — never committed)
+.specify/
+specs/

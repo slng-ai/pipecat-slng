@@ -38,3 +38,22 @@ def test_v14_sync_installs_all_extras_from_lock():
     for sync in syncs:
         assert "--all-extras" in sync, "sync must install extras (examples deps)"
         assert "--locked" in sync, "sync must fail on stale uv.lock (V14)"
+
+
+def test_ci_live_selector_excludes_exactly_the_live_tests():
+    """CI's pytest step must deselect live tests by MARKER, not by name.
+
+    `-k 'not live'` matches substrings, so it also deselected every
+    keepaLIVE test — silently, with a green run. A marker selector cannot
+    collide with a test's name.
+    """
+    pytest_runs = [c for c in _run_commands() if "pytest" in c]
+    assert pytest_runs, "expected a pytest step in ci.yml"
+    for run in pytest_runs:
+        assert "-k 'not live'" not in run, (
+            "-k matches substrings and silently deselects keepalive tests; "
+            f"use -m 'not live' instead: {run}"
+        )
+        assert "-m 'not live'" in run, (
+            f"pytest step must deselect live-marked tests: {run}"
+        )

@@ -23,9 +23,12 @@ from pipecat.tests.utils import SleepFrame, run_test
 
 from pipecat_slng import SlngHttpTTSService, SlngSTTService, SlngTTSService
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv("SLNG_API_KEY"), reason="SLNG_API_KEY not set"
-)
+# Marked, not name-matched: `-k 'not live'` also deselects anything whose name
+# merely contains "live" — it silently dropped all three keepaLIVE tests.
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(not os.getenv("SLNG_API_KEY"), reason="SLNG_API_KEY not set"),
+]
 
 
 async def test_live_tts_returns_audio():

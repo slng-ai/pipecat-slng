@@ -39,6 +39,10 @@ from pipecat_slng._errors import connect_error_detail
 
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
+# Matches the STT leg; the bridge documents the keepalive message but no
+# interval. ponytail: not a kwarg — nothing to tune it against yet.
+_KEEPALIVE_INTERVAL = 30.0
+
 
 @dataclass
 class SlngTTSSettings(TTSSettings):
@@ -171,12 +175,16 @@ class SlngTTSService(WebsocketTTSService):
         self._world_part_override = world_part_override
         self._provider_key = provider_key
         self._receive_task = None
+        self._keepalive_task = None
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
         # Some upstreams (e.g. rime) close the WebSocket right after
         # audio_end/flushed; that close is part of the utterance lifecycle,
         # not a failure (V15).
         self._expect_server_close = False
+        # Which event armed the flag; flushed fires every utterance, audio_end
+        # is what the arming was built for. Logged on absorption to tell them apart.
+        self._expect_server_close_reason: str | None = None
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -220,15 +228,41 @@ class SlngTTSService(WebsocketTTSService):
             self._receive_task = self.create_task(
                 self._receive_task_handler(self._report_error)
             )
+        if self._websocket and not self._keepalive_task:
+            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
         await super()._disconnect()
+
+        if self._keepalive_task:
+            await self.cancel_task(self._keepalive_task)
+            self._keepalive_task = None
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
         await self._disconnect_websocket()
+
+    async def _keepalive_task_handler(self):
+        """Send a ``keepalive`` control frame while the socket is idle.
+
+        ``WebsocketTTSService`` has no keepalive machinery of its own, so this
+        mirrors the local task other Pipecat TTS services use.
+
+        Never ``break`` on a send error: a completed task is truthy, so
+        ``_connect`` would not recreate it and ``_maybe_try_reconnect`` never
+        touches it — one transient error would kill the keepalive for the
+        session. The open-state check handles a dead socket instead.
+        """
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            if not self._websocket or self._websocket.state is not State.OPEN:
+                continue
+            try:
+                await self._websocket.send(json.dumps({"type": "keepalive"}))
+            except Exception as e:
+                logger.warning(f"{self}: keepalive send failed: {e}")
 
     def _build_config(self) -> dict[str, Any]:
         """Build the inner ``config`` object of the init message.
@@ -332,7 +366,12 @@ class SlngTTSService(WebsocketTTSService):
         """
         if self._expect_server_close and not self._disconnecting:
             self._expect_server_close = False
-            logger.debug(f"{self}: expected per-utterance server close, reconnecting")
+            armed_by = self._expect_server_close_reason
+            self._expect_server_close_reason = None
+            logger.debug(
+                f"{self}: expected per-utterance server close "
+                f"(armed by {armed_by}), reconnecting"
+            )
             await self._disconnect_websocket()
             await self._connect_websocket()
             return True  # receive loop continues on the new socket
@@ -422,6 +461,7 @@ class SlngTTSService(WebsocketTTSService):
 
         elif type_lc == "flushed":
             self._expect_server_close = True
+            self._expect_server_close_reason = "flushed"
             ctx_id = self.get_active_audio_context_id()
             if ctx_id:
                 await self.append_to_audio_context(
@@ -435,6 +475,7 @@ class SlngTTSService(WebsocketTTSService):
         elif type_lc == "audio_end":
             logger.trace(f"{self}: SLNG TTS audio_end: {data}")
             self._expect_server_close = True
+            self._expect_server_close_reason = "audio_end"
 
         elif type_lc == "error":
             raw = data.get("data")
@@ -496,6 +537,7 @@ class SlngTTSService(WebsocketTTSService):
                 # server that did NOT close after audio_end must not mask a
                 # later real failure (V15).
                 self._expect_server_close = False
+                self._expect_server_close_reason = None
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:

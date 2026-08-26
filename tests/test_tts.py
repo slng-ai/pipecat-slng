@@ -13,6 +13,7 @@ import wave
 from typing import Any
 
 import pytest
+from websockets.protocol import State
 from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
 from pipecat.tests.utils import SleepFrame, run_test
 
@@ -623,3 +624,121 @@ async def test_v15_unexpected_close_delegates_to_base(monkeypatch):
 
     assert calls == ["boom"]
     assert result is False
+
+
+async def test_idle_keepalive_sent(patch_ws, monkeypatch):
+    """An idle WS-TTS session sends {"type": "keepalive"}.
+
+    The TTS bridge documents keepalive as preventing an inactivity close. The
+    STT side of this plugin already sends one; without this the socket can be
+    dropped mid-call, putting a reconnect plus init on the path to the next
+    segment's first audio.
+    """
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.05)
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "keepalive" for m in text_sends)
+
+
+async def test_keepalive_stops_on_disconnect(patch_ws, monkeypatch):
+    """The keepalive task does not outlive its socket."""
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.05)
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.2)])
+
+    assert tts._keepalive_task is None
+    # Reopen the fake so a surviving task COULD send: with the socket left
+    # CLOSED the handler's open-state guard suppresses sends anyway, and the
+    # assertion below would pass whether or not the task was cancelled.
+    fake.state = State.OPEN
+    sent_after_stop = len(fake.sent)
+    await asyncio.sleep(0.2)
+    assert len(fake.sent) == sent_after_stop
+
+
+async def test_expected_close_reports_arming_event(patch_ws):
+    """The expected-close flag records which event armed it.
+
+    `flushed` is sent after every utterance on every route; only some upstreams
+    follow `audio_end` with an actual close. Recording which one armed the flag
+    makes "does any route close after flushed?" answerable from real logs,
+    instead of narrowing the arming on speculation and risking a regression on
+    the upstream the flag was added for.
+    """
+    patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await tts._process_message({"type": "flushed"})
+    assert tts._expect_server_close is True
+    assert tts._expect_server_close_reason == "flushed"
+
+    tts._expect_server_close = False
+    tts._expect_server_close_reason = None
+
+    await tts._process_message({"type": "audio_end"})
+    assert tts._expect_server_close is True
+    assert tts._expect_server_close_reason == "audio_end"
+
+
+async def test_keepalive_survives_expected_close_reconnect(monkeypatch):
+    """Keepalive keeps firing after a per-utterance close swaps the socket.
+
+    `_maybe_try_reconnect` swaps sockets via `_disconnect_websocket`/
+    `_connect_websocket`, which never touch `_keepalive_task`. A handler that
+    broke out of its loop on a send error would leave a *completed* task behind
+    — truthy, so `_connect`'s `not self._keepalive_task` guard would never
+    recreate it — and the keepalive would be silently dead for the rest of the
+    session, which is the idle close it exists to prevent.
+    """
+    from conftest import FakeWebSocket
+
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.05)
+    fakes: list[FakeWebSocket] = []
+
+    async def _connect(url, **kwargs):
+        fake = FakeWebSocket([json.dumps({"type": "ready"})])
+        fakes.append(fake)
+        return fake
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", _connect)
+    tts = _make_tts()
+
+    async def close_first_socket():
+        while not fakes:
+            await asyncio.sleep(0.01)
+
+        # Make the next keepalive send fail, then close: exactly the transient
+        # error + reconnect sequence that killed the task before.
+        original_send = fakes[0].send
+
+        async def _boom(_data):
+            raise ConnectionError("keepalive send failed")
+
+        monkeypatch.setattr(fakes[0], "send", _boom)
+        await asyncio.sleep(0.12)
+        monkeypatch.setattr(fakes[0], "send", original_send)
+        await fakes[0].feed(json.dumps({"type": "audio_end"}))
+        await fakes[0].close()
+
+    driver = asyncio.create_task(close_first_socket())
+    try:
+        await run_test(tts, frames_to_send=[SleepFrame(sleep=0.6)])
+    finally:
+        await asyncio.wait_for(driver, timeout=5)
+
+    assert len(fakes) >= 2, "expected close should have opened a replacement socket"
+    replacement_keepalives = [
+        s
+        for s in fakes[-1].sent
+        if isinstance(s, str) and json.loads(s).get("type") == "keepalive"
+    ]
+    assert replacement_keepalives, (
+        "keepalive died: no keepalive on the replacement socket after a send "
+        "error + per-utterance reconnect"
+    )
