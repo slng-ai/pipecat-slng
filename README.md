@@ -87,6 +87,24 @@ Three behaviors worth knowing:
   mid-session (via Pipecat settings updates) reconnects the WebSocket to
   re-run the init handshake — expect a brief reconnect, not a silent no-op.
 
+### Pronunciation dictionaries
+
+Streaming TTS can use one SLNG pronunciation dictionary as the WebSocket
+session default. Reference it by name or immutable ID; SLNG validates and
+applies the rewrite rules.
+
+```python
+tts = SlngTTSService(
+    api_key=os.getenv("SLNG_API_KEY"),
+    model="slng/deepgram/aura:2-en",
+    voice="aura-2-thalia-en",
+    pronunciation={"mode": "rewrite", "name": "support-pronunciations"},
+)
+```
+
+Use `{"mode": "rewrite", "dictionary_id": "pd_..."}` to reference an
+immutable dictionary version. See the [pronunciation dictionary docs](https://docs.slng.ai/pronunciation-dictionaries).
+
 ## HTTP TTS (non-streaming fallback)
 
 For simple request/response synthesis where streaming is not required, use

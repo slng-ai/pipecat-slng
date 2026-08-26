@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import wave
+from typing import Any
 
 import pytest
 from websockets.protocol import State
@@ -28,7 +29,7 @@ def _make_tts():
 
 
 async def test_init_message_includes_voice(patch_ws):
-    """Init message carries voice at top level and config fields."""
+    """Init carries voice/config fields and omits unset pronunciation."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = _make_tts()
 
@@ -38,6 +39,35 @@ async def test_init_message_includes_voice(patch_ws):
     init = next(m for m in text_sends if m.get("type") == "init")
     assert init["voice"] == "aura-2-thalia-en"
     assert init["config"]["sample_rate"] == 24000
+    assert "pronunciation" not in init["config"]
+
+
+@pytest.mark.parametrize(
+    ("pronunciation", "via_settings"),
+    [
+        ({"mode": "rewrite", "name": "brand-pronunciations"}, False),
+        ({"mode": "rewrite", "dictionary_id": "pd_01abc"}, True),
+    ],
+)
+async def test_ws_pronunciation_ref_passed_through(
+    patch_ws: Any, pronunciation: dict[str, str], via_settings: bool
+) -> None:
+    """Name and ID references reach init config unchanged."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    settings = SlngTTSSettings(pronunciation=pronunciation) if via_settings else None
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        pronunciation=None if via_settings else pronunciation,
+        settings=settings,
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    init = next(m for m in text_sends if m.get("type") == "init")
+    assert init["config"]["pronunciation"] == pronunciation
 
 
 async def test_text_frame_sends_text_message(patch_ws):
@@ -256,8 +286,14 @@ async def test_http_non_200_yields_error_frame():
 
 
 async def test_ws_update_settings_reconnects(monkeypatch):
-    """A changed setting triggers a reconnect so init is re-sent."""
-    tts = _make_tts()
+    """A changed setting reconnects without clearing unrelated settings."""
+    pronunciation = {"mode": "rewrite", "name": "brand-pronunciations"}
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        pronunciation=pronunciation,
+    )
 
     calls: list = []
 
@@ -273,6 +309,8 @@ async def test_ws_update_settings_reconnects(monkeypatch):
     changed = await tts._update_settings(SlngTTSSettings(voice="aura-2-asteria-en"))
 
     assert "voice" in changed
+    assert "pronunciation" not in changed
+    assert tts._settings.pronunciation == pronunciation
     assert calls == ["disconnect", "connect"]
 
 

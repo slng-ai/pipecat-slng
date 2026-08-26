@@ -90,6 +90,7 @@ async def run_bot(transport: BaseTransport):
         model=tts_model,
         voice=tts_voice,
         provider_key=provider_key,
+        pronunciation={"mode": "rewrite", "name": "brand-pronunciations"},
     )
 
     llm = OpenAIResponsesLLMService(
@@ -136,7 +137,15 @@ async def run_bot(transport: BaseTransport):
 
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
-        context.add_message({"role": "user", "content": "Please introduce yourself."})
+        context.add_message(
+            {
+                "role": "user",
+                "content": (
+                    "Please introduce yourself as the SLNG voice assistant, "
+                    "using the name SLNG exactly as written."
+                ),
+            }
+        )
         await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_connected")
