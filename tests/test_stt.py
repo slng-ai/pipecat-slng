@@ -6,11 +6,13 @@
 
 """Unit tests for SlngSTTService using a fake WebSocket."""
 
+import asyncio
 import json
 
 import pytest
 from pipecat.frames.frames import (
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -92,21 +94,20 @@ async def test_audio_sent_as_binary(patch_ws):
     assert any(isinstance(s, bytes) and s == audio for s in fake.sent)
 
 
-async def test_low_confidence_transcript_dropped(patch_ws):
-    """A final_transcript with confidence < 0.5 is suppressed (community guide)."""
+async def test_low_confidence_final_is_still_emitted(patch_ws):
+    """A low-confidence final_transcript is never dropped.
+
+    Dropping it hangs the turn: _maybe_trigger_user_turn_stopped returns early
+    with no text (turn_analyzer_user_turn_stop_strategy.py:350) and the timeout
+    handler routes through the same check, so the turn never stops until some
+    later transcript arrives.
+    """
     patch_ws(
         "pipecat_slng.stt",
         [
             json.dumps({"type": "ready"}),
             json.dumps(
                 {"type": "final_transcript", "transcript": "noise", "confidence": 0.3}
-            ),
-            json.dumps(
-                {
-                    "type": "final_transcript",
-                    "transcript": "real text",
-                    "confidence": 0.9,
-                }
             ),
         ],
     )
@@ -123,7 +124,38 @@ async def test_low_confidence_transcript_dropped(patch_ws):
     )
 
     transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
-    assert [t.text for t in transcripts] == ["real text"]
+    assert [t.text for t in transcripts] == ["noise"]
+
+
+async def test_low_confidence_partial_is_dropped(patch_ws):
+    """A low-confidence partial_transcript is still filtered.
+
+    The community-integration guide asks for >50% confidence filtering; applying
+    it to interim frames keeps junk out of the visible transcript at no cost to
+    the turn lifecycle.
+    """
+    patch_ws(
+        "pipecat_slng.stt",
+        [
+            json.dumps({"type": "ready"}),
+            json.dumps(
+                {"type": "partial_transcript", "transcript": "noise", "confidence": 0.3}
+            ),
+        ],
+    )
+    stt = _make_stt()
+
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            SleepFrame(sleep=0.3),
+        ],
+    )
+
+    assert not [f for f in down if isinstance(f, InterimTranscriptionFrame)]
 
 
 async def test_region_and_world_headers_sent(patch_ws):
@@ -233,37 +265,72 @@ async def test_vad_stop_sends_finalize(patch_ws):
     assert any(m.get("type") == "finalize" for m in text_sends)
 
 
-async def test_from_finalize_confirms_finalize(patch_ws, monkeypatch):
-    """A final_transcript with from_finalize=true calls confirm_finalize()."""
-    patch_ws(
-        "pipecat_slng.stt",
-        [
-            json.dumps({"type": "ready"}),
-            json.dumps(
-                {
-                    "type": "final_transcript",
-                    "transcript": "hello",
-                    "from_finalize": True,
-                }
-            ),
-        ],
-    )
+async def test_vad_stop_then_final_marks_frame_finalized(patch_ws):
+    """VAD stop + final_transcript marks the TranscriptionFrame finalized.
+
+    This is the whole 1.0s: Pipecat 1.7.0 ends the user turn on a finalized
+    transcript and otherwise waits out a safety-net timer anchored to
+    speech_end + ttfs_p99_latency (turn_analyzer_user_turn_stop_strategy.py:236,
+    :354). The SLNG bridge has no finalize-correlation field, so any final is
+    the answer to an outstanding finalize.
+    """
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = _make_stt()
 
-    calls: list = []
-    monkeypatch.setattr(stt, "confirm_finalize", lambda: calls.append("confirmed"))
+    # The final must arrive AFTER the VAD-stop frame is processed, otherwise this
+    # is the no-finalize-outstanding case instead. Pre-queuing it would race the
+    # receive loop, so feed it on a delay.
+    async def _feed_final_after_vad_stop():
+        await asyncio.sleep(0.15)
+        await fake.feed(json.dumps({"type": "final_transcript", "transcript": "hello"}))
 
-    await run_test(
+    feeder = asyncio.create_task(_feed_final_after_vad_stop())
+    down, _ = await run_test(
         stt,
         frames_to_send=[
             InputAudioRawFrame(
                 audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
             ),
-            SleepFrame(sleep=0.3),
+            VADUserStoppedSpeakingFrame(),
+            SleepFrame(sleep=0.4),
+        ],
+    )
+    await feeder
+
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert transcripts, "no TranscriptionFrame pushed"
+    assert transcripts[0].finalized is True
+
+
+async def test_final_without_vad_stop_is_not_finalized(patch_ws):
+    """A final arriving with no finalize outstanding stays unfinalized.
+
+    confirm_finalize() no-ops unless request_finalize() ran (stt_service.py
+    :221-223), so a mid-utterance final must not end the turn early. Guards
+    against "simplifying" the fix into unconditionally setting finalized.
+    """
+    patch_ws(
+        "pipecat_slng.stt",
+        [
+            json.dumps({"type": "ready"}),
+            json.dumps({"type": "final_transcript", "transcript": "hello"}),
+        ],
+    )
+    stt = _make_stt()
+
+    down, _ = await run_test(
+        stt,
+        frames_to_send=[
+            InputAudioRawFrame(
+                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+            ),
+            SleepFrame(sleep=0.2),
         ],
     )
 
-    assert calls == ["confirmed"]
+    transcripts = [f for f in down if isinstance(f, TranscriptionFrame)]
+    assert transcripts, "no TranscriptionFrame pushed"
+    assert transcripts[0].finalized is False
 
 
 async def test_disconnect_sends_close(patch_ws):

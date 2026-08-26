@@ -3,6 +3,81 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Turn timing: the user turn now ends when the transcript arrives, not 1.0 s after
+  the caller stops speaking.** This changes conversational timing for every existing
+  downstream user and is the reason to read this entry.
+
+  `SlngSTTService` sent `{"type": "finalize"}` on `VADUserStoppedSpeakingFrame` but
+  never called Pipecat's `request_finalize()`, and it only called `confirm_finalize()`
+  when a transcript carried `from_finalize` — a Deepgram field that is **not part of
+  the SLNG bridge protocol** and that only appeared when a route happened to pass the
+  raw upstream payload through. So `TranscriptionFrame.finalized` was `False` on every
+  frame the plugin ever emitted.
+
+  In Pipecat 1.7.0 the turn ends on a finalized transcript, and otherwise waits out a
+  safety-net timer anchored to `speech_end + ttfs_p99_latency`
+  (`turn_analyzer_user_turn_stop_strategy.py:236`). With no declared TTFS the fallback
+  is `DEFAULT_TTFS_P99 = 1.0`, so **every turn waited a fixed 1.0 s after end of
+  speech**, however fast the bridge replied. Lowering the VAD `stop_secs` did not help,
+  because the deadline is anchored to actual end of speech rather than to VAD's report
+  of it.
+
+  Both `TurnAnalyzerUserTurnStopStrategy` and `SpeechTimeoutUserTurnStopStrategy` now
+  short-circuit that timer. If you tuned `stop_secs`, `user_turn_stop_timeout`, or an
+  `endpointing_delay` to compensate for the old fixed second, re-check those values.
+
+- **Low-confidence final transcripts are no longer dropped.** The `confidence < 0.5`
+  filter applied to finals as well as partials. Dropping a final does not lose a word —
+  it hangs the turn: the turn-stop strategy returns early when it has no text
+  (`turn_analyzer_user_turn_stop_strategy.py:350`), and the timeout handler routes
+  through the same check, so the turn did not stop at all until a later transcript
+  arrived. On noisy or accented audio that presented as an agent frozen mid-call.
+  The filter now applies to partial transcripts only, which is what the Pipecat
+  community-integration guide's ">50% confidence" bullet was reaching for.
+
+- **`SlngTTSService` now sends the bridge's `keepalive` while idle.** It previously
+  sent none, so a long caller turn could leave the synthesis socket idle long enough
+  for the bridge to close it for inactivity — putting a full WebSocket reconnect plus
+  `init` handshake on the path to the next segment's first audio byte. The interval is
+  30 s, matching the STT side of the same bridge; neither bridge reference documents an
+  interval or an idle timeout. The task is cancelled on disconnect and does not outlive
+  its socket.
+
+### Deferred — blocked on live bridge access
+
+Recorded so the reasoning is not re-derived. None of these ship in this release.
+
+- **A measured `ttfs_p99_latency` constant.** No code is needed — the kwarg already
+  reaches the base class, so `SlngSTTService(..., ttfs_p99_latency=0.42)` works today
+  and is the supported way to right-size the residual timer per deployment. Only the
+  measured default is missing. `stt-benchmark` supports a fixed built-in service
+  registry that does not include this package, so measuring it needs a registry entry
+  upstream in addition to live credentials. Measure at `VADParams.stop_secs=0.2` (the
+  threshold every built-in value assumes) and report the SLNG-hosted and proxied
+  routes separately. Until then the "ttfs_p99_latency not set" warning at pipeline
+  start persists; it is cosmetic, since a finalized transcript now cancels the timer
+  it sizes.
+- **A warm standby TTS socket (`warm_standby_enabled`).** Not implemented; a consumer
+  passing the kwarg still has it absorbed by `**kwargs` with no effect. Whether it is
+  worth building depends on whether any route actually closes after `flushed`. The
+  expected-close reconnect log now names which event armed the flag, so that question
+  is answerable from any real call's logs rather than by speculation.
+- **`utterance_end` as a finalization signal.** The bridge scopes it to models whose
+  catalog declares a `tokenStream` with `finalMarkers` (its documented examples are
+  Soniox `<end>`/`<fin>` tokens); the `deepgram/nova` routes in use are not such
+  models, and its only payload field is a timestamp, so it carries no transcript.
+  Left logged at trace level.
+- **A `mulaw`/8000 Hz phone leg.** Only half available: the STT bridge accepts
+  `linear16`, `mp3`, and `opus` — **not** `mulaw` — though it does accept 8000 Hz. The
+  TTS bridge does list `mulaw`. Not pursued without a phone-leg measurement.
+
+Tested with Pipecat v1.7.0 (declared floor remains `pipecat-ai>=1.3.0`; the finalize
+and TTFS APIs are identical at both versions).
+
 ## [0.4.0] - 2026-06-12
 
 ### Added

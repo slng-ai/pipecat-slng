@@ -60,10 +60,23 @@ Defaults when not specified: STT uses `language=Language.EN`,
 `enable_vad=True`, `enable_partials=True`; TTS uses `language=Language.EN`
 and the server's default `speed`.
 
-Two behaviors worth knowing:
+Three behaviors worth knowing:
 
-- **Confidence filter (STT).** When the provider surfaces a confidence
-  score, transcripts below 0.5 are dropped.
+- **Confidence filter (STT).** When the provider surfaces a confidence score,
+  *partial* transcripts below 0.5 are dropped. Finals are never dropped —
+  discarding one hangs the user turn rather than losing a word.
+- **Turn finalization (STT).** On `VADUserStoppedSpeakingFrame` the service
+  sends `finalize` and marks the answering transcript
+  `TranscriptionFrame.finalized`, which is what lets Pipecat end the user turn
+  immediately instead of waiting out its safety-net timer. That timer is sized
+  by `ttfs_p99_latency`, which this service does not yet declare a measured
+  default for, so Pipecat substitutes a conservative 1.0 s and logs a warning at
+  pipeline start. You can pass your own measured value —
+  `SlngSTTService(..., ttfs_p99_latency=0.42)` — measured with
+  [stt-benchmark](https://github.com/pipecat-ai/stt-benchmark) at
+  `VADParams.stop_secs=0.2`, the threshold Pipecat's built-in values assume.
+  It only affects the fallback path, since a finalized transcript cancels the
+  timer before it fires.
 - **Runtime settings updates.** Changing `voice`, `speed`, or `language`
   mid-session (via Pipecat settings updates) reconnects the WebSocket to
   re-run the init handshake — expect a brief reconnect, not a silent no-op.

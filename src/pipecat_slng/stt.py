@@ -193,6 +193,7 @@ class SlngSTTService(WebsocketSTTService):
             await self.start_processing_metrics()
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             if self._websocket and self._websocket.state is State.OPEN:
+                self.request_finalize()
                 await self._websocket.send(json.dumps({"type": "finalize"}))
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:  # ty: ignore[invalid-method-override]
@@ -423,8 +424,14 @@ class SlngSTTService(WebsocketSTTService):
         passed through.
 
         When the bridge surfaces a top-level ``confidence`` score (optional in
-        the AsyncAPI spec), transcripts below 0.5 are dropped per the Pipecat
-        community-integration guide ("filter for values >50% confidence").
+        the AsyncAPI spec), *partial* transcripts below 0.5 are dropped per the
+        Pipecat community-integration guide ("filter for values >50%
+        confidence"). Finals are never dropped: the guide's bullet is generic
+        and predates the 1.7.0 turn machinery, and discarding a final hangs the
+        turn rather than losing a word —
+        ``_maybe_trigger_user_turn_stopped`` returns early when there is no text
+        (``turn_analyzer_user_turn_stop_strategy.py:350``) and the timeout
+        handler routes through the same check.
         """
         transcript = (data.get("transcript") or "").strip()
         if not transcript:
@@ -436,8 +443,12 @@ class SlngSTTService(WebsocketSTTService):
             return
 
         confidence = data.get("confidence")
+        # ponytail: partials-only filter, threshold stays module-private. Revisit
+        # only if a route is observed emitting useful sub-threshold partials; a
+        # kwarg whose only correct setting is "never drop finals" is not a knob.
         if (
-            isinstance(confidence, (int, float))
+            not is_final
+            and isinstance(confidence, (int, float))
             and not isinstance(confidence, bool)
             and confidence < 0.5
         ):
@@ -455,8 +466,11 @@ class SlngSTTService(WebsocketSTTService):
                 pass
 
         if is_final:
-            if data.get("from_finalize"):
-                self.confirm_finalize()
+            # The SLNG bridge has no finalize-correlation field, so any final is
+            # the answer to an outstanding finalize. Unguarded is safe:
+            # confirm_finalize() no-ops unless request_finalize() ran
+            # (stt_service.py:221-223), and that resets per utterance on VAD start.
+            self.confirm_finalize()
             await self.push_frame(
                 TranscriptionFrame(
                     transcript,
