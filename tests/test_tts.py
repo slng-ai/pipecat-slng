@@ -585,3 +585,59 @@ async def test_v15_unexpected_close_delegates_to_base(monkeypatch):
 
     assert calls == ["boom"]
     assert result is False
+
+
+async def test_idle_keepalive_sent(patch_ws, monkeypatch):
+    """An idle WS-TTS session sends {"type": "keepalive"}.
+
+    The TTS bridge documents keepalive as preventing an inactivity close. The
+    STT side of this plugin already sends one; without this the socket can be
+    dropped mid-call, putting a reconnect plus init on the path to the next
+    segment's first audio.
+    """
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.05)
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.3)])
+
+    text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
+    assert any(m.get("type") == "keepalive" for m in text_sends)
+
+
+async def test_keepalive_stops_on_disconnect(patch_ws, monkeypatch):
+    """The keepalive task does not outlive its socket."""
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.05)
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.2)])
+
+    assert tts._keepalive_task is None
+    sent_after_stop = len(fake.sent)
+    await asyncio.sleep(0.2)
+    assert len(fake.sent) == sent_after_stop
+
+
+async def test_expected_close_reports_arming_event(patch_ws):
+    """The expected-close flag records which event armed it.
+
+    `flushed` is sent after every utterance on every route; only some upstreams
+    follow `audio_end` with an actual close. Recording which one armed the flag
+    makes "does any route close after flushed?" answerable from real logs,
+    instead of narrowing the arming on speculation and risking a regression on
+    the upstream the flag was added for.
+    """
+    patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await tts._process_message({"type": "flushed"})
+    assert tts._expect_server_close is True
+    assert tts._expect_server_close_reason == "flushed"
+
+    tts._expect_server_close = False
+    tts._expect_server_close_reason = None
+
+    await tts._process_message({"type": "audio_end"})
+    assert tts._expect_server_close is True
+    assert tts._expect_server_close_reason == "audio_end"
