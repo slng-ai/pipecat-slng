@@ -26,6 +26,13 @@ def _make_stt():
     return SlngSTTService(api_key="test-key", sample_rate=16000)
 
 
+def _audio():
+    """One 10ms frame of silence — enough to open the stream."""
+    return InputAudioRawFrame(
+        audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
+    )
+
+
 async def test_init_message_sent_on_start(patch_ws):
     """Service sends an init message with config after connecting."""
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
@@ -67,9 +74,7 @@ async def test_final_transcript_emits_transcription_frame(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             SleepFrame(sleep=0.2),
         ],
     )
@@ -117,9 +122,7 @@ async def test_low_confidence_final_is_still_emitted(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             SleepFrame(sleep=0.3),
         ],
     )
@@ -149,9 +152,7 @@ async def test_low_confidence_partial_is_dropped(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             SleepFrame(sleep=0.3),
         ],
     )
@@ -254,9 +255,7 @@ async def test_vad_stop_sends_finalize(patch_ws):
     await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.2),
         ],
@@ -289,9 +288,7 @@ async def test_vad_stop_then_final_marks_frame_finalized(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.4),
         ],
@@ -322,9 +319,7 @@ async def test_final_without_vad_stop_is_not_finalized(patch_ws):
     down, _ = await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             SleepFrame(sleep=0.2),
         ],
     )
@@ -360,9 +355,7 @@ async def test_interruption_clears_pending_finalize(patch_ws):
     await run_test(
         stt,
         frames_to_send=[
-            InputAudioRawFrame(
-                audio=b"\x00\x00" * 160, sample_rate=16000, num_channels=1
-            ),
+            _audio(),
             VADUserStoppedSpeakingFrame(),
             SleepFrame(sleep=0.1),
             InterruptionFrame(),

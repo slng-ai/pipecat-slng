@@ -197,11 +197,8 @@ class SlngSTTService(WebsocketSTTService):
                 self.request_finalize()
                 await self._websocket.send(json.dumps({"type": "finalize"}))
         elif isinstance(frame, InterruptionFrame):
-            # The base class clears the finalize handshake only on VAD start
-            # (stt_service.py:594-595); InterruptionFrame is emitted from an
-            # InterruptionWorkerFrame with no VAD coupling, so an unanswered
-            # finalize can outlive the turn that requested it and mark an
-            # unrelated later final as finalized — ending that turn early.
+            # No VAD coupling here, so the base class's VAD-start reset never
+            # runs and an unanswered finalize would outlive its turn.
             self._finalize_requested = False
             self._finalize_pending = False
 
@@ -452,9 +449,8 @@ class SlngSTTService(WebsocketSTTService):
             return
 
         confidence = data.get("confidence")
-        # ponytail: partials-only filter, threshold stays module-private. Revisit
-        # only if a route is observed emitting useful sub-threshold partials; a
-        # kwarg whose only correct setting is "never drop finals" is not a knob.
+        # ponytail: partials only — dropping a final hangs the turn, so the
+        # threshold stays module-private and there is no kwarg.
         if (
             not is_final
             and isinstance(confidence, (int, float))
@@ -475,10 +471,8 @@ class SlngSTTService(WebsocketSTTService):
                 pass
 
         if is_final:
-            # The SLNG bridge has no finalize-correlation field, so any final is
-            # the answer to an outstanding finalize. Unguarded is safe:
-            # confirm_finalize() no-ops unless request_finalize() ran
-            # (stt_service.py:221-223), and that resets per utterance on VAD start.
+            # No correlation field on the wire, so any final answers the
+            # finalize; confirm_finalize() no-ops unless one is outstanding.
             self.confirm_finalize()
             await self.push_frame(
                 TranscriptionFrame(

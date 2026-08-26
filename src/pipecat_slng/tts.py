@@ -39,11 +39,8 @@ from pipecat_slng._errors import connect_error_detail
 
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
-# Seconds between keepalive sends on an idle WS-TTS socket. The TTS bridge
-# documents the keepalive message ("Prevents the connection from being closed
-# due to inactivity") but neither an interval nor an idle timeout, so this
-# matches the STT leg of the same bridge, where 30s is already proven.
-# ponytail: module-private, not a kwarg — nothing to tune it against yet.
+# Matches the STT leg; the bridge documents the keepalive message but no
+# interval. ponytail: not a kwarg — nothing to tune it against yet.
 _KEEPALIVE_INTERVAL = 30.0
 
 
@@ -175,10 +172,8 @@ class SlngTTSService(WebsocketTTSService):
         # audio_end/flushed; that close is part of the utterance lifecycle,
         # not a failure (V15).
         self._expect_server_close = False
-        # Which event armed the flag above. flushed arrives after every
-        # utterance on every route; audio_end is what the arming was actually
-        # built for. Reported on absorption so the population of upstreams that
-        # close after flushed is answerable from logs rather than guessed at.
+        # Which event armed the flag; flushed fires every utterance, audio_end
+        # is what the arming was built for. Logged on absorption to tell them apart.
         self._expect_server_close_reason: str | None = None
 
     def can_generate_metrics(self) -> bool:
@@ -242,21 +237,13 @@ class SlngTTSService(WebsocketTTSService):
     async def _keepalive_task_handler(self):
         """Send a ``keepalive`` control frame while the socket is idle.
 
-        ``WebsocketTTSService`` has no keepalive machinery of its own (unlike
-        ``WebsocketSTTService``, which inherits it from ``STTService``), so this
+        ``WebsocketTTSService`` has no keepalive machinery of its own, so this
         mirrors the local task other Pipecat TTS services use.
 
-        A send failure must NOT break the loop. The per-utterance reconnect in
-        ``_maybe_try_reconnect`` swaps the socket via
-        ``_disconnect_websocket``/``_connect_websocket`` and never touches this
-        task, and a completed task is truthy — so ``_connect``'s
-        ``not self._keepalive_task`` guard would never recreate it. Breaking here
-        would silently kill the keepalive for the rest of the session after one
-        transient error, which is the idle close this exists to prevent. The
-        base class hits the same hazard and solves it by restarting the task
-        (``stt_service.py`` ``_reconnect_websocket``); continuing is smaller and
-        needs no restart path. The open-state check below makes a dead socket
-        cost one no-op wakeup per interval.
+        Never ``break`` on a send error: a completed task is truthy, so
+        ``_connect`` would not recreate it and ``_maybe_try_reconnect`` never
+        touches it — one transient error would kill the keepalive for the
+        session. The open-state check handles a dead socket instead.
         """
         while True:
             await asyncio.sleep(_KEEPALIVE_INTERVAL)
