@@ -19,13 +19,20 @@ SPEC.md
 
 # Editor / IDE
 .idea/
-.claude/
+
+# Claude Code. Skills are shared, so `git worktree add` carries them into every
+# new worktree. settings.local.json is per-machine and worktrees/ holds the
+# worktrees themselves — neither belongs in history.
+.claude/*
+!.claude/skills/
 
 # Tool caches
 .pytest_cache/
 .ruff_cache/
 .DS_Store
 
-# Spec Kit (local specs/plans — never committed)
-.specify/
+# Spec Kit. The scaffolding (templates, scripts, workflows, constitution) is
+# shared so every worktree gets it from git rather than a manual copy;
+# .specify/.gitignore excludes the machine-local parts (feature.json).
+# Feature specs under specs/ stay local.
 specs/
