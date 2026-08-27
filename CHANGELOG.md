@@ -19,6 +19,10 @@ to [Semantic Versioning](https://semver.org/).
   plain rename to the public `NotGiven` — no behavior change, no public API
   change to this package.
 
+  Verified against Pipecat 1.8.0: the package and both submodules import, all
+  three services construct, and both `is_given` branches behave. Offline suite
+  is 59 passing on 1.8.0.
+
   This is deliberately a hard cut rather than a `try/except ImportError` alias:
   `NotGiven` does not exist before 1.8.0, so one import line cannot serve both,
   and shimming would preserve a range that was never tested anyway.
