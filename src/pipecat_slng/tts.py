@@ -27,7 +27,7 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, is_given
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, NotGiven, is_given
 from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -55,8 +55,8 @@ class SlngTTSSettings(TTSSettings):
         pronunciation: Optional session pronunciation dictionary reference.
     """
 
-    speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pronunciation: dict[str, str] | None | _NotGiven = field(
+    speed: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pronunciation: dict[str, str] | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -111,8 +111,8 @@ class SlngTTSService(WebsocketTTSService):
         region_override: str | None = None,
         world_part_override: str | None = None,
         provider_key: str | None = None,
-        language: Language | _NotGiven = NOT_GIVEN,
-        speed: float | None | _NotGiven = NOT_GIVEN,
+        language: Language | NotGiven = NOT_GIVEN,
+        speed: float | None | NotGiven = NOT_GIVEN,
         pronunciation: dict[str, str] | None = None,
         settings: Settings | None = None,
         **kwargs,
@@ -636,8 +636,8 @@ class SlngHttpTTSService(TTSService):
         region_override: str | None = None,
         world_part_override: str | None = None,
         provider_key: str | None = None,
-        language: Language | _NotGiven = NOT_GIVEN,
-        speed: float | None | _NotGiven = NOT_GIVEN,
+        language: Language | NotGiven = NOT_GIVEN,
+        speed: float | None | NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):

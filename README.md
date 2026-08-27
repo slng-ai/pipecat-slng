@@ -10,7 +10,8 @@ multiple STT/TTS providers (Deepgram, ElevenLabs, Rime, Sarvam, and more)
 through a single API key. Swap the `model` string to switch providers; no other
 code changes needed.
 
-> Tested with Pipecat v1.3.0.
+> Requires Pipecat v1.8.0 or newer, and is tested against v1.8.0. Earlier
+> `pipecat-slng` releases do not import on Pipecat 1.8.0.
 
 ## Installation
 
