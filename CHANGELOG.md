@@ -3,7 +3,7 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] - 2026-08-27
+## [0.5.1] - 2026-08-27
 
 ### Changed
 
