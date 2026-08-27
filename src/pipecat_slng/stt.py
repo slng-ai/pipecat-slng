@@ -28,7 +28,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, is_given
+from pipecat.services.settings import NOT_GIVEN, STTSettings, NotGiven, is_given
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -52,8 +52,8 @@ class SlngSTTSettings(STTSettings):
         enable_partials: Whether to receive partial (interim) transcriptions.
     """
 
-    enable_vad: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_partials: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_vad: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_partials: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class SlngSTTService(WebsocketSTTService):
@@ -85,9 +85,9 @@ class SlngSTTService(WebsocketSTTService):
         region_override: str | None = None,
         world_part_override: str | None = None,
         provider_key: str | None = None,
-        language: Language | _NotGiven = NOT_GIVEN,
-        enable_vad: bool | _NotGiven = NOT_GIVEN,
-        enable_partials: bool | _NotGiven = NOT_GIVEN,
+        language: Language | NotGiven = NOT_GIVEN,
+        enable_vad: bool | NotGiven = NOT_GIVEN,
+        enable_partials: bool | NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -202,7 +202,7 @@ class SlngSTTService(WebsocketSTTService):
             self._finalize_requested = False
             self._finalize_pending = False
 
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:  # ty: ignore[invalid-method-override]
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Process audio data for speech-to-text transcription.
 
         Sends raw PCM audio bytes as a binary WebSocket frame. Waits for the

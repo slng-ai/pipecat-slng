@@ -3,6 +3,35 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-08-27
+
+### Changed
+
+- **Requires `pipecat-ai>=1.8.0`. Versions 0.5.0 and earlier cannot be used with
+  Pipecat 1.8.0 at all** — every `import pipecat_slng` raises `ImportError`, so
+  this is not an optional upgrade if you are moving to 1.8.0.
+
+  `stt.py` and `tts.py` imported `_NotGiven` from `pipecat.services.settings`.
+  That sentinel was always private, and 1.8.0 moved it to
+  `pipecat/utils/types.py` and made it public as `NotGiven`. The other names on
+  the same import line (`NOT_GIVEN`, `is_given`, the `*Settings` bases) are
+  re-exported and still resolve; only the private one is gone. The fix is a
+  plain rename to the public `NotGiven` — no behavior change, no public API
+  change to this package.
+
+  This is deliberately a hard cut rather than a `try/except ImportError` alias:
+  `NotGiven` does not exist before 1.8.0, so one import line cannot serve both,
+  and shimming would preserve a range that was never tested anyway.
+
+- **The declared Pipecat floor is now the version CI actually runs.** `uv.lock`
+  pinned `pipecat-ai` 1.3.0 while `pyproject.toml` declared `>=1.3.0`, and CI
+  installs with `uv sync --locked` — so the suite had only ever run against the
+  bottom of a range whose upper end was a guess. That is why the plugin's own
+  tests were green on the day it stopped importing. The lock now pins 1.8.0,
+  matching the floor, and `tests/test_dependency_contract.py` fails if the two
+  ever drift apart (V27) or if any module under `src/pipecat_slng/` imports a
+  leading-underscore name from `pipecat.*` again (V26).
+
 ## [0.5.0] - 2026-08-26
 
 ### Fixed
