@@ -3,6 +3,125 @@
 All notable changes to `pipecat-slng` are documented here. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A TTS session that ends without the server closing the socket is now rebuilt,
+  so one bad turn no longer mutes the agent for the rest of the call.** This changes
+  connection lifecycle on every WebSocket TTS route and is the reason to read this
+  entry.
+
+  Observed with `soniox/tts-rt:v1`: the greeting spoke, and every turn after it
+  failed with `SLNG TTS error: Stream <id> not found. Send a start message first.`
+  — the same error, forever, with `TTS context ... completed with no audio` behind
+  it. The bridge ends its synthesis stream on flush and does not open a new one,
+  but the plugin is what made it unrecoverable. Two gaps, both now closed:
+
+  - **A completed utterance now closes the connection when the server left it open.**
+    The per-utterance reconnect added in 0.3.0 only fired when the *server* closed
+    (`slng/rime/arcana`); a route that finishes the utterance and keeps the socket
+    never reached it, so the next turn was sent into a spent stream. Closing routes
+    both shapes through the same quiet reconnect.
+
+    `audio_end` and `flushed` are now handled as one "utterance complete" path.
+    Which of the two a route sends is a per-route accident: `soniox/tts-rt:v1`
+    sends `audio_end` and **never** `flushed`, though the plugin does send the
+    `flush` that precedes it. It does close on its own eventually — 40 s after
+    `audio_end` in an observed call, long after the next turn needed the session.
+
+    **The rebuild happens as the next turn starts, not when the previous one
+    ended.** The bridge drops a session that receives no text within **5 s** of
+    `init` (measured at 5.054 s and 5.053 s on consecutive turns), so rebuilding
+    at end-of-turn left the new session idle through the user's whole turn and
+    it timed out every time — a `Request timeout` error frame per turn and two
+    sessions burned. Rebuilding from `on_turn_context_created`, as Pipecat's own
+    `services/soniox/tts.py` does, overlaps the handshake with sentence
+    aggregation instead: off the critical path, and short enough not to trip the
+    idle timer.
+
+    **Only routes that need it pay for it.** The rebuild is armed by a session
+    actually failing, not by a model-name table: `cartesia/sonic:3.5` and the
+    deepgram routes also send `audio_end` but keep the session usable, and
+    rebuilding them anyway cost a measured ~440 ms of time-to-first-audio per
+    turn for nothing. A route that never fails is never rebuilt and behaves
+    exactly as it did before this release. A route that does fail costs one
+    recoverable error per call — inaudible, since recovery no longer drops the
+    turn — and is then rebuilt between turns for the rest of the call.
+
+    An interruption counts as spending the session too. A barge-in ends the turn
+    before `audio_end` arrives, so the signal the rebuild keys on never comes —
+    the turn after an interruption was sent into a dead stream and lost its
+    first sentence, because that sentence had already gone out before the error
+    came back. Pipecat's own `services/soniox/tts.py` likewise treats an
+    interruption as ending the stream.
+
+    **The utterance a dying session takes down with it is spoken anyway.**
+    Nothing can predict a route's first failure, so one turn per call is sent
+    into a session that has already died — observed as "Of course!" going out
+    44 ms before the error came back and never being heard, while every later
+    sentence of the same turn waited on the ready gate and played normally.
+    Text that drew an error instead of audio is now replayed on the replacement
+    session, ahead of the rest of the turn. Text that already produced audio is
+    never replayed, so the recovery cannot speak anything twice.
+
+    **Not re-tested live on `slng/rime/arcana:3-en`**, the close-after-flush route
+    the 0.3.0 handling was built for — a deliberate call, not a blocked one.
+    Covered offline instead — three consecutive per-utterance closes still
+    reconnect quietly with no error frames, and a route sending both `audio_end`
+    and `flushed` ends its turn exactly once rather than twice. What stays
+    unverified for that shape is turn-boundary *timing*: `TTSStoppedFrame` is now
+    emitted on whichever terminal signal arrives first, so on a route sending
+    `audio_end` before `flushed` the turn ends marginally earlier than it did.
+
+    This also means the workaround retires itself: if the bridge is fixed to
+    open a fresh stream per utterance, no session fails, nothing arms, and the
+    per-turn rebuild simply never runs.
+  - **An `error` on a live session now tears that session down.** Previously the
+    error was logged and pushed downstream while the socket stayed open and the
+    session stayed marked ready, so every later utterance drew the identical error.
+    An error arriving *before* the session is ready — a rejected config, a bad key —
+    is deliberately left to Pipecat's backoff and permanent give-up, because
+    rebuilding cannot fix it.
+
+  **Timing — partly measured, not yet settled.** The rebuild is triggered at turn
+  start and races the LLM's first sentence. In one observed turn on
+  `soniox/tts-rt:v1` the handshake took 1.13 s while the LLM gave 0.84 s of lead, so
+  the turn's *first* sentence waited ~290 ms on the ready gate; later sentences in
+  the same turn were unaffected. **That is a single sample and must not be treated
+  as the number** — one run proves nothing. Still owed: several samples per
+  configuration, and the same comparison on a route that reuses one session for the
+  whole call (`deepgram/aura`, `cartesia/sonic`), which has not been run against
+  this version at all.
+
+  **Recovery keeps the turn it interrupts.** The error usually lands mid-turn, before
+  the reply's audio has arrived. Tearing the session down through the normal
+  disconnect path also tore down the active audio context, so everything the rebuilt
+  session then delivered for that turn was discarded — heard as the agent starting a
+  sentence or two into its reply. The error path now drops the transport without
+  touching the audio context.
+
+  **Rebuilding no longer opens two sockets.** `run_tts` finding no connection and the
+  receive task's own rebuild both open one, and only the socket the receive loop picks
+  up is ever read — the utterance sent on the other is lost with no error, and the send
+  after it draws a server-side timeout. Seen in a live call as two `Connecting to SLNG
+  TTS` for a single `session ready`. Connecting is now serialised.
+
+  Also fixed while here: `on_disconnected` fired **twice** per utterance once the
+  plugin closes the socket itself, because the reconnect path tore down again
+  unconditionally. It now skips the teardown when there is nothing left to tear down,
+  so consumers still see exactly one event per reconnect.
+
+  No new dependency, no new constructor argument, no public API change. `run_tts` is
+  untouched, so the V15 stale-flag guard from 0.5.0 and its test are unchanged.
+
+  Verified against Pipecat 1.8.0: 65 offline tests pass, including these new checks —
+  a completed utterance rebuilds a session the server left open; the utterance after
+  an error produces audio; an error before `ready` still delegates to the base class;
+  one reconnect fires one `on_disconnected`; and audio delivered after a mid-turn
+  error still reaches the listener; one error costs exactly one rebuilt connection; and a route that sends only
+  `audio_end` is rebuilt just like one that sends `flushed`.
+
 ## [0.5.1] - 2026-08-27
 
 ### Changed
