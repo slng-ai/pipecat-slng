@@ -178,9 +178,25 @@ class SlngTTSService(WebsocketTTSService):
         self._keepalive_task = None
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
-        # Some upstreams (e.g. rime) close the WebSocket right after
-        # audio_end/flushed; that close is part of the utterance lifecycle,
-        # not a failure (V15).
+        # Set once a session has actually died mid-call. Only then is the
+        # per-turn rebuild worth its handshake: routes that reuse one session
+        # for a whole call (cartesia, deepgram) never set it and never pay it.
+        self._session_dies_per_utterance = False
+        # The text of the utterance in flight, cleared as soon as any audio
+        # comes back for it. If the session dies before that, this is what was
+        # lost and is safe to send again on the replacement.
+        self._unvoiced_text: str | None = None
+        self._pending_resend: str | None = None
+        # Serialises connect: `run_tts` finding no socket and the receive
+        # task's own rebuild can otherwise both open one, and only the socket
+        # the receive loop picks up is ever read. The utterance sent on the
+        # other is lost with no error.
+        self._connect_lock = asyncio.Lock()
+        # A close arriving now is the utterance ending, not a failure (V15).
+        # Armed by audio_end/flushed, and by an error on a live session. Some
+        # upstreams (e.g. rime) close by themselves; for the rest the flushed
+        # and error branches close, so both shapes reach the same quiet
+        # reconnect.
         self._expect_server_close = False
         # Which event armed the flag; flushed fires every utterance, audio_end
         # is what the arming was built for. Logged on absorption to tell them apart.
@@ -280,6 +296,11 @@ class SlngTTSService(WebsocketTTSService):
         with an error and ignores subsequent messages. The server responds with
         a ``ready`` message once the session is established.
         """
+        async with self._connect_lock:
+            await self._connect_websocket_locked()
+
+    async def _connect_websocket_locked(self):
+        """Body of :meth:`_connect_websocket`, run under ``_connect_lock``."""
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
@@ -349,10 +370,13 @@ class SlngTTSService(WebsocketTTSService):
         raise Exception("SLNG TTS websocket not connected")
 
     async def _maybe_try_reconnect(self, error_message, report_error, error=None):
-        """Handle a server-initiated close, distinguishing expected from failure.
+        """Handle an expected end-of-session close, distinguishing it from failure.
 
-        Some upstreams close the WebSocket (code 1000) right after
-        ``audio_end``/``flushed`` — a per-utterance lifecycle, not an error.
+        Reached two ways. Some upstreams close the WebSocket (code 1000) right
+        after ``audio_end``/``flushed`` — a per-utterance lifecycle, not an
+        error. For upstreams that leave the socket open, the ``flushed`` and
+        ``error`` branches close it themselves, which ends the receive loop and
+        lands here the same way.
         Reconnect quietly so the close neither logs reconnect warnings nor
         feeds the base class quick-failure counter (which would otherwise shut
         the service down after 3 short utterances in a row). Runs inside the
@@ -372,10 +396,55 @@ class SlngTTSService(WebsocketTTSService):
                 f"{self}: expected per-utterance server close "
                 f"(armed by {armed_by}), reconnecting"
             )
-            await self._disconnect_websocket()
+            # Only tear down a socket that is still here: `flushed`/`error`
+            # close it themselves, and `_disconnect_websocket`'s `finally`
+            # fires `on_disconnected` unconditionally — a second call would
+            # double that event for consumers on every utterance.
+            if self._websocket:
+                await self._disconnect_websocket()
             await self._connect_websocket()
             return True  # receive loop continues on the new socket
         return await super()._maybe_try_reconnect(error_message, report_error, error)
+
+    async def on_turn_context_created(self, context_id: str):
+        """Rebuild a spent session as the next turn begins, once one has died.
+
+        Gated on a session having actually failed earlier in this call
+        (``_session_dies_per_utterance``). Routes that keep one session for a
+        whole call — cartesia, deepgram — never trip that, so they keep the
+        single session they have always had; rebuilding them anyway cost a
+        measured ~440 ms of time-to-first-audio per turn for nothing.
+
+        Called when the LLM starts a response (or a ``TTSSpeakFrame`` arrives),
+        which is before text reaches ``run_tts`` but only shortly before — so
+        the handshake overlaps sentence aggregation instead of sitting idle
+        through the user's turn. Routes whose stream ends per utterance
+        (``soniox/tts-rt:v1``) need a fresh session here; the alternative,
+        rebuilding when the previous turn ended, trips the bridge's idle
+        timeout every turn.
+
+        Runs in the frame-processing task, not the receive task, so the
+        cancelling ``_disconnect``/``_connect`` pair is the correct one: it
+        restarts the receive task on the new socket.
+
+        Args:
+            context_id: The newly created turn context ID.
+        """
+        if (
+            self._session_dies_per_utterance
+            and self._expect_server_close
+            and not self._disconnecting
+        ):
+            armed_by = self._expect_server_close_reason
+            self._expect_server_close = False
+            self._expect_server_close_reason = None
+            logger.debug(
+                f"{self}: session spent (armed by {armed_by}), "
+                f"rebuilding for the next turn"
+            )
+            await self._disconnect()
+            await self._connect()
+        await super().on_turn_context_created(context_id)
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Send a ``Clear`` message to the server when the bot is interrupted.
@@ -389,6 +458,13 @@ class SlngTTSService(WebsocketTTSService):
                 await self._websocket.send(json.dumps({"type": "clear"}))
             except Exception as e:
                 logger.warning(f"{self}: failed to send clear on interruption: {e}")
+        # An interruption ends the utterance too, and on a route whose stream
+        # does not outlive it that spends the session just as `audio_end`
+        # does — but no `audio_end` follows an interrupted turn, so without
+        # this the next turn is sent into a dead stream. Pipecat's own
+        # `services/soniox/tts.py` likewise cancels the stream here.
+        self._expect_server_close = True
+        self._expect_server_close_reason = "interrupted"
         await super().on_audio_context_interrupted(context_id)
 
     async def flush_audio(self, context_id: str | None = None):
@@ -432,6 +508,7 @@ class SlngTTSService(WebsocketTTSService):
         """Append a binary audio chunk to the active audio context."""
         if not audio:
             return
+        self._unvoiced_text = None
         ctx_id = self.get_active_audio_context_id()
         frame = TTSAudioRawFrame(
             audio=audio,
@@ -454,28 +531,46 @@ class SlngTTSService(WebsocketTTSService):
         if type_lc == "ready":
             session_id = data.get("session_id", "")
             logger.debug(f"{self}: SLNG TTS session ready (id={session_id})")
+            if self._pending_resend is not None and self._websocket:
+                text, self._pending_resend = self._pending_resend, None
+                logger.debug(f"{self}: resending lost utterance [{text}]")
+                try:
+                    self._unvoiced_text = text
+                    await self._websocket.send(
+                        json.dumps({"type": "text", "text": text})
+                    )
+                except Exception as resend_error:
+                    logger.warning(f"{self}: resend failed: {resend_error}")
+            # Set last: `run_tts` is blocked on this, so the replayed text is
+            # already queued ahead of the rest of the turn.
             self._ready_event.set()
 
         elif type_lc == "metadata":
             logger.trace(f"{self}: SLNG TTS metadata: {data}")
 
-        elif type_lc == "flushed":
+        elif type_lc in ("flushed", "audio_end"):
+            # Both mean "this utterance is done"; which one a route sends is
+            # a per-route accident. `soniox/tts-rt:v1` sends only `audio_end`
+            # and never `flushed`, so keying the teardown on `flushed` alone
+            # left its spent stream open and the next turn drew
+            # "Stream <id> not found".
+            logger.trace(f"{self}: SLNG TTS {type_lc}: {data}")
             self._expect_server_close = True
-            self._expect_server_close_reason = "flushed"
+            self._expect_server_close_reason = type_lc
             ctx_id = self.get_active_audio_context_id()
             if ctx_id:
                 await self.append_to_audio_context(
                     ctx_id, TTSStoppedFrame(context_id=ctx_id)
                 )
                 await self.remove_audio_context(ctx_id)
+            # Only arm. The rebuild happens when the *next* turn starts, in
+            # `on_turn_context_created` — rebuilding here would leave the new
+            # session idle for the whole of the user's turn, and the bridge
+            # drops a session that gets no text within ~5s of `init`
+            # (measured twice at 5.05s on `soniox/tts-rt:v1`).
 
         elif type_lc == "cleared":
             pass
-
-        elif type_lc == "audio_end":
-            logger.trace(f"{self}: SLNG TTS audio_end: {data}")
-            self._expect_server_close = True
-            self._expect_server_close_reason = "audio_end"
 
         elif type_lc == "error":
             raw = data.get("data")
@@ -490,6 +585,60 @@ class SlngTTSService(WebsocketTTSService):
             logger.error(f"{self}: SLNG TTS error: {error_msg}")
             await self.push_error(error_msg=str(error_msg))
             await self.stop_all_metrics()
+            # The session that produced this is not usable again: sending the
+            # next utterance down it just draws the same error, which is how a
+            # single bad turn used to mute the rest of the call. Close so the
+            # reconnect path rebuilds it, exactly as for a spent session.
+            #
+            # ponytail: `_ready_event` stands in for "this session did some
+            # work". An error arriving before `ready` is a rejected config or a
+            # bad key, which rebuilding cannot fix, so it is left to the base
+            # class's backoff and permanent give-up. Ceiling: a server that
+            # sends `ready` and then errors unprompted would reconnect at
+            # handshake rate — warm, not spinning, and one error frame per
+            # cycle. Upgrade path if that is ever observed: track whether text
+            # was actually sent on the session and gate on that instead.
+            if self._ready_event.is_set() and not self._disconnecting:
+                # This route's session does not survive its utterance. Learn
+                # it from the failure rather than from a model-name table:
+                # from here on the session is rebuilt between turns, so this
+                # costs one recoverable error per call instead of a handshake
+                # on every turn of every route.
+                self._session_dies_per_utterance = True
+                # Whatever was in flight drew this error instead of audio, so
+                # it is lost unless it is sent again. Gated on no audio having
+                # arrived for it, which is what makes a resend safe rather
+                # than a duplicate.
+                #
+                # ponytail: only the most recent text is recovered. Later
+                # sentences of the turn block on `_ready_event` and go out on
+                # the replacement by themselves, so in practice one is all
+                # that is ever in flight. If a route is ever seen to lose
+                # more, keep the unvoiced sends in a list instead.
+                self._pending_resend = self._unvoiced_text
+                self._unvoiced_text = None
+                self._ready_event.clear()
+                self._expect_server_close = True
+                self._expect_server_close_reason = "error"
+                # Drop the transport directly rather than via
+                # `_disconnect_websocket`: its `finally` calls
+                # `remove_active_audio_context`, which is right at the end of a
+                # turn and wrong here. This error usually lands mid-turn, and
+                # tearing the context down would discard everything the
+                # rebuilt session then delivers for it — the agent starts a
+                # sentence or two late. Clearing `_websocket` also makes the
+                # reconnect path skip its own teardown, so the context and the
+                # single `on_disconnected` both survive.
+                ws = self._websocket
+                self._websocket = None
+                if ws:
+                    try:
+                        await ws.close()
+                    except Exception as close_error:
+                        logger.debug(
+                            f"{self}: error closing failed session: {close_error}"
+                        )
+                    await self._call_event_handler("on_disconnected")
 
         else:
             logger.debug(f"{self}: unknown message: {data}")
@@ -538,6 +687,7 @@ class SlngTTSService(WebsocketTTSService):
                 # later real failure (V15).
                 self._expect_server_close = False
                 self._expect_server_close_reason = None
+                self._unvoiced_text = text
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
