@@ -5,6 +5,64 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `world_part` is now required on all three services, and both
+  regional override settings are gone.** Every `SlngSTTService`,
+  `SlngTTSService`, and `SlngHttpTTSService` construction must pass
+  `world_part=`, the hostname prefix of the SLNG destination. There is no
+  default, no environment fallback, and no compatibility alias.
+
+  Requests now carry the routing choice in the hostname:
+
+  | Service | Endpoint |
+  |---|---|
+  | `SlngSTTService` | `wss://{world_part}.api.slng.ai/v1/bridges/unmute/stt/{model}` |
+  | `SlngTTSService` | `wss://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}` |
+  | `SlngHttpTTSService` | `https://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}` |
+
+  `region_override` and `world_part_override` are removed, along with the
+  `X-Region-Override` / `X-World-Part-Override` headers and the `region` /
+  `world-part` query parameters they produced. Nothing replaces them on the
+  wire. Because Pipecat's base classes silently accept unknown keyword
+  arguments, passing either name now raises `TypeError` with migration
+  guidance — including when the value is `None` — so no existing call can lose
+  its routing quietly.
+
+  `base_url` changed from a host string with a default to `str | None = None`.
+  Omitted or `None` generates `{world_part}.api.slng.ai`; an explicit value is
+  an advanced override that keeps its own host **unchanged**, including the
+  legacy unprefixed `api.slng.ai`, staging hosts, and hosts that already carry
+  a world part. `world_part` stays required and validated either way. An empty
+  or malformed base is rejected rather than falling back to automatic routing.
+
+  **Migration.** Pick a destination where your models are provisioned —
+  `us-east`, `us-west`, `br`, `eu-west` (Germany), `eu-north` (Finland), `gb`,
+  `za`, `il`, `jp`, `sg`, `id`, `in`, or `au` — define it once in your
+  application code, and pass it to every SLNG service. Delete
+  `region_override=` / `world_part_override=`, and delete any `base_url=` you
+  were passing: leaving the old `api.slng.ai` value in place now deliberately
+  bypasses world-part routing. Do not put the destination in `.env` — it is a
+  code parameter, and `.env.example` gains no world-part setting.
+
+  Invalid configuration fails at construction, before the parent constructor
+  allocates anything and before any network activity. There is no
+  cross-destination fallback: a failing destination is retried as itself, never
+  against another world part or the unprefixed gateway. A syntactically valid
+  prefix that SLNG has not provisioned yields a normal connection error.
+
+  Authentication, BYOK (`provider_key`), model routing and escaping, speech
+  payloads, audio/transcript delivery, and connection lifecycle are unchanged.
+
+  Verified against Pipecat 1.8.0 on Python 3.11.15: offline suite 333 passing,
+  covering all 13 destinations across all three services (39 combinations),
+  explicit legacy/staging/already-prefixed base precedence, and the constructor
+  error matrix, including credential-safe URL parser errors. Live smoke tests
+  skip cleanly without credentials; STT checks require server readiness and no
+  error frames so a rejected connection cannot pass with an empty transcript.
+  Offline tests disable Pipecat's unused tokenizer warmup, avoiding NLTK
+  imports/downloads inside the test helper's startup deadline.
+
 ### Fixed
 
 - **A TTS session that ends without the server closing the socket is now rebuilt,

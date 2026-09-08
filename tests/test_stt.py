@@ -19,11 +19,37 @@ from pipecat.frames.frames import (
 )
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_slng import SlngSTTService
+from pipecat_slng import SlngHttpTTSService, SlngSTTService, SlngTTSService
+
+
+# The 13 SLNG destinations from spec.md. Routing uses the prefix itself; the
+# descriptive groups (Americas/Europes/Asia) are never hostnames.
+_DESTINATIONS = (
+    "us-east",
+    "us-west",
+    "br",
+    "eu-west",
+    "eu-north",
+    "gb",
+    "za",
+    "il",
+    "jp",
+    "sg",
+    "id",
+    "in",
+    "au",
+)
+# A prefix SLNG has not provisioned yet, plus both length boundaries, must work
+# without a package update — the adapter validates syntax, not a catalog.
+_FUTURE_PREFIXES = ("mars-1", "a", "a" * 63)
+_WORLD_PART = "eu-west"
+
+_STT_ROUTE = "/v1/bridges/unmute/stt/"
+_DEFAULT_MODEL_PATH = "slng/deepgram/nova:3-en"
 
 
 def _make_stt():
-    return SlngSTTService(api_key="test-key", sample_rate=16000)
+    return SlngSTTService(api_key="test-key", world_part=_WORLD_PART, sample_rate=16000)
 
 
 def _audio():
@@ -160,20 +186,131 @@ async def test_low_confidence_partial_is_dropped(patch_ws):
     assert not [f for f in down if isinstance(f, InterimTranscriptionFrame)]
 
 
-async def test_region_and_world_headers_sent(patch_ws):
-    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
-    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
-    stt = SlngSTTService(
-        api_key="test-key",
-        sample_rate=16000,
-        region_override="eu-north-1",
-        world_part_override="eu",
+@pytest.mark.parametrize("world_part", [*_DESTINATIONS, *_FUTURE_PREFIXES])
+async def test_stt_default_host_is_world_part_prefix(patch_ws, world_part):
+    """With no base override the host is exactly ``{world_part}.api.slng.ai``.
+
+    Unprefixed ``api.slng.ai`` is reachable only by explicitly passing it as
+    ``base_url`` — never as a default or a fallback.
+    """
+    fake = patch_ws("pipecat_slng.stt", [])
+    stt = SlngSTTService(api_key="test-key", world_part=world_part, sample_rate=16000)
+
+    await stt._connect_websocket()
+
+    assert fake.connect_url == (
+        f"wss://{world_part}.api.slng.ai{_STT_ROUTE}{_DEFAULT_MODEL_PATH}"
+    )
+    # The hostname carries the routing choice: no legacy header, no init field.
+    assert list(fake.connect_headers) == ["Authorization"]
+    init = json.loads(fake.sent[0])
+    assert not {"region", "world-part", "world_part"} & (
+        set(init) | set(init["config"])
     )
 
-    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
 
-    assert fake.connect_headers["X-Region-Override"] == "eu-north-1"
-    assert fake.connect_headers["X-World-Part-Override"] == "eu"
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [
+        (None, "wss://in.api.slng.ai"),
+        ("api.slng.ai", "wss://api.slng.ai"),
+        ("wss://api.slng.ai", "wss://api.slng.ai"),
+        # Already prefixed hosts are kept as supplied — never re-prefixed,
+        # whether or not they match world_part.
+        ("gb.api.slng.ai", "wss://gb.api.slng.ai"),
+        ("in.api.slng.ai", "wss://in.api.slng.ai"),
+        ("wss://GB.API.SLNG.AI.", "wss://GB.API.SLNG.AI."),
+        ("ws://staging.example:8080/gateway/", "ws://staging.example:8080/gateway"),
+    ],
+)
+async def test_stt_explicit_base_keeps_supplied_host(patch_ws, base_url, expected_base):
+    """An explicit base overrides world-part host generation, unchanged.
+
+    The first two rows are spec.md's two exact ``sarvam/saaras:v3`` URLs.
+    """
+    fake = patch_ws("pipecat_slng.stt", [])
+    stt = SlngSTTService(
+        api_key="test-key",
+        world_part="in",
+        base_url=base_url,
+        model="sarvam/saaras:v3",
+        sample_rate=16000,
+    )
+
+    await stt._connect_websocket()
+
+    assert fake.connect_url == f"{expected_base}{_STT_ROUTE}sarvam/saaras:v3"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [(None, "wss://eu-north.api.slng.ai"), ("api.slng.ai", "wss://api.slng.ai")],
+)
+async def test_stt_base_retained_on_reconnect_and_model_change(
+    patch_ws, base_url, expected_base
+):
+    """Reconnects keep the selected base; only the escaped model route moves."""
+    fake = patch_ws("pipecat_slng.stt", [])
+    stt = SlngSTTService(
+        api_key="test-key", world_part="eu-north", base_url=base_url, sample_rate=16000
+    )
+
+    await stt._connect_websocket()
+    first_url = fake.connect_url
+
+    stt._websocket = None  # force the reconnect path
+    stt._settings.model = "my provider/model:v1"
+    await stt._connect_websocket()
+
+    assert first_url == f"{expected_base}{_STT_ROUTE}{_DEFAULT_MODEL_PATH}"
+    assert fake.connect_url == f"{expected_base}{_STT_ROUTE}my%20provider/model:v1"
+
+
+async def test_stt_instances_route_independently(patch_ws):
+    """One service's destination never changes another's."""
+    fake = patch_ws("pipecat_slng.stt", [])
+    automatic = SlngSTTService(api_key="test-key", world_part="jp", sample_rate=16000)
+    explicit = SlngSTTService(
+        api_key="test-key", world_part="jp", base_url="api.slng.ai", sample_rate=16000
+    )
+
+    await automatic._connect_websocket()
+    automatic_url = fake.connect_url
+    await explicit._connect_websocket()
+
+    assert automatic_url == f"wss://jp.api.slng.ai{_STT_ROUTE}{_DEFAULT_MODEL_PATH}"
+    assert fake.connect_url == f"wss://api.slng.ai{_STT_ROUTE}{_DEFAULT_MODEL_PATH}"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_host"),
+    [(None, "za.api.slng.ai"), ("api.slng.ai", "api.slng.ai")],
+)
+async def test_stt_connect_failure_never_falls_back(
+    monkeypatch, base_url, expected_host
+):
+    """An unavailable destination is retried as itself, never as another host."""
+    attempts: list[str] = []
+
+    async def _reject(url, **kwargs):
+        attempts.append(url)
+        raise OSError("destination unavailable")
+
+    monkeypatch.setattr("pipecat_slng.stt.websocket_connect", _reject)
+    stt = SlngSTTService(
+        api_key="test-key", world_part="za", base_url=base_url, sample_rate=16000
+    )
+
+    async def _swallow(error_msg, exception=None):
+        pass
+
+    monkeypatch.setattr(stt, "push_error", _swallow)
+
+    for _ in range(2):
+        with pytest.raises(OSError):
+            await stt._connect_websocket()
+
+    assert attempts == [f"wss://{expected_host}{_STT_ROUTE}{_DEFAULT_MODEL_PATH}"] * 2
 
 
 async def test_provider_key_header_sent(patch_ws):
@@ -181,6 +318,7 @@ async def test_provider_key_header_sent(patch_ws):
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = SlngSTTService(
         api_key="test-key",
+        world_part=_WORLD_PART,
         sample_rate=16000,
         provider_key="my-provider-key",
     )
@@ -207,6 +345,7 @@ async def test_route3_external_model_no_key_no_byok_header(patch_ws):
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = SlngSTTService(
         api_key="test-key",
+        world_part=_WORLD_PART,
         model="deepgram/nova:3",  # external route — no slng/ prefix
         sample_rate=16000,
     )
@@ -365,3 +504,189 @@ async def test_interruption_clears_pending_finalize(patch_ws):
 
     assert stt._finalize_requested is False
     assert stt._finalize_pending is False
+
+
+# ---------------------------------------------------------------------------
+# Constructor boundary — shared by all three services (US2)
+# ---------------------------------------------------------------------------
+
+_SERVICES = (SlngSTTService, SlngTTSService, SlngHttpTTSService)
+
+_INVALID_WORLD_PARTS = (
+    None,
+    "",
+    " ",
+    "\t",
+    "GB",  # uppercase is rejected, never silently lowercased
+    "eu west",
+    "eu_west",
+    "-gb",
+    "gb-",
+    "a" * 64,
+    "eu-west.api.slng.ai",  # a full host would double the hostname
+    "wss://eu-west.api.slng.ai",
+    5,
+    b"gb",
+)
+
+# Bases that are malformed for every service. Already prefixed SLNG hosts are
+# valid overrides instead — see test_stt_explicit_base_keeps_supplied_host.
+_INVALID_BASES = (
+    "",
+    "   ",
+    0,
+    b"api.slng.ai",
+    "api.slng.ai?region=eu",
+    "api.slng.ai#eu",
+    "api.slng.ai\nevil.example",
+    "api.slng.ai:",
+    "api.slng.ai:abc",
+    "api.slng.ai:99999",
+    "api.slng.ai:0",
+    "1.2.3.4",
+    "[::1]",
+    "under_score.example",
+    "://api.slng.ai",
+)
+
+_REMOVED_OVERRIDES = (
+    {"region_override": "eu-north-1"},
+    {"world_part_override": "eu"},
+    {"region_override": None},  # a null value is still an explicit use
+    {"world_part_override": None},
+    {"region_override": "eu-north-1", "world_part_override": "eu"},
+    {"region_override": None, "world_part_override": None},
+)
+
+
+def _construct(cls, **kwargs):
+    """Construct any of the three services with the given routing arguments."""
+    return cls(api_key="test-key", **kwargs)
+
+
+def _legacy_base(cls) -> str:
+    """The legacy unprefixed gateway in the form this service accepts."""
+    return "https://api.slng.ai" if cls is SlngHttpTTSService else "api.slng.ai"
+
+
+def _own_scheme(cls, rest: str) -> str:
+    """A base with this service's own scheme, so scheme checks pass first."""
+    return f"https://{rest}" if cls is SlngHttpTTSService else f"wss://{rest}"
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("with_base", [False, True])
+async def test_omitted_world_part_raises_native_missing_keyword(cls, with_base):
+    """Omitting the destination is the native missing-argument error."""
+    extra = {"base_url": _legacy_base(cls)} if with_base else {}
+    with pytest.raises(TypeError, match="missing.*world_part"):
+        _construct(cls, **extra)
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("removed", _REMOVED_OVERRIDES)
+async def test_omitted_world_part_outranks_removed_override_error(cls, removed):
+    """A missing required keyword is reported before the migration error."""
+    with pytest.raises(TypeError, match="missing.*world_part"):
+        _construct(cls, **removed)
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("world_part", _INVALID_WORLD_PARTS)
+@pytest.mark.parametrize("with_base", [False, True])
+async def test_invalid_world_part_is_rejected(cls, world_part, with_base):
+    """An invalid prefix fails at construction, with or without a base override.
+
+    An explicit base does not consume the destination: it stays required and
+    validated so a typo can never quietly fall through to another host.
+    """
+    extra = {"base_url": _legacy_base(cls)} if with_base else {}
+    with pytest.raises(ValueError, match="world_part"):
+        _construct(cls, world_part=world_part, **extra)
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("removed", _REMOVED_OVERRIDES)
+async def test_removed_regional_overrides_are_rejected(cls, removed):
+    """Removed settings must not disappear into Pipecat's tolerant **kwargs."""
+    with pytest.raises(TypeError) as exc:
+        _construct(cls, world_part=_WORLD_PART, **removed)
+
+    message = str(exc.value)
+    assert all(name in message for name in removed)
+    assert "world_part" in message
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("base_url", _INVALID_BASES)
+async def test_invalid_explicit_base_is_rejected(cls, base_url):
+    """A malformed base is an error, never a silent switch to automatic routing."""
+    with pytest.raises(ValueError, match="base_url"):
+        _construct(cls, world_part=_WORLD_PART, base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    ("cls", "base_url"),
+    [
+        (SlngSTTService, "https://api.slng.ai"),
+        (SlngTTSService, "http://api.slng.ai"),
+        (SlngHttpTTSService, "api.slng.ai"),  # HTTP needs a full URL, not a host
+        (SlngHttpTTSService, "wss://api.slng.ai"),
+    ],
+)
+async def test_base_scheme_must_match_the_transport(cls, base_url):
+    """Each service accepts only the schemes it can actually connect with."""
+    with pytest.raises(ValueError, match="base_url"):
+        _construct(cls, world_part=_WORLD_PART, base_url=base_url)
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+@pytest.mark.parametrize("host", ["staging.example", "staging.example\uff0f", "["])
+async def test_base_credentials_rejected_without_echoing_the_secret(cls, host):
+    """Guidance names the setting; it never repeats an embedded credential."""
+    secret = "s3cr3t-token"
+    with pytest.raises(ValueError) as exc:
+        _construct(
+            cls,
+            world_part=_WORLD_PART,
+            base_url=_own_scheme(cls, f"user:{secret}@{host}"),
+        )
+
+    assert "base_url" in str(exc.value)
+    assert secret not in str(exc.value)
+
+
+async def test_invalid_config_never_reaches_parent_init(monkeypatch):
+    """Validation precedes super().__init__, which allocates local resources."""
+    from pipecat.processors.frame_processor import FrameProcessor
+
+    initialized: list[str] = []
+    original = FrameProcessor.__init__
+
+    def _record(self, *args, **kwargs):
+        initialized.append(type(self).__name__)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(FrameProcessor, "__init__", _record)
+
+    for cls in _SERVICES:
+        for bad in (
+            {"world_part": "GB"},
+            {"world_part": _WORLD_PART, "region_override": "eu-north-1"},
+            {"world_part": _WORLD_PART, "base_url": ""},
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                _construct(cls, **bad)
+
+    assert initialized == []
+    # The patch does record a valid construction, so the check above is real.
+    _construct(SlngSTTService, world_part=_WORLD_PART)
+    assert initialized == ["SlngSTTService"]
+
+
+@pytest.mark.parametrize("cls", _SERVICES)
+async def test_unrelated_pipecat_kwargs_still_pass_through(cls):
+    """Rejecting the old names must not reject legitimate parent kwargs."""
+    service = _construct(cls, world_part=_WORLD_PART, name="my-service")
+
+    assert service.name == "my-service"

@@ -35,6 +35,7 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._endpoints import resolve_base_url
 from pipecat_slng._errors import connect_error_detail
 
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
@@ -84,7 +85,7 @@ class SlngTTSService(WebsocketTTSService):
     """Text-to-speech service using the SLNG Unmute TTS bridge WebSocket API.
 
     Provides real-time speech synthesis through a persistent WebSocket
-    connection to ``wss://api.slng.ai/v1/bridges/unmute/tts/{model}``:
+    connection to ``wss://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}``:
 
     - Connection-level config (``voice``, ``encoding``, ``sample_rate``,
       ``speed``, ``language``) is sent in an ``init`` text message.
@@ -103,13 +104,12 @@ class SlngTTSService(WebsocketTTSService):
         self,
         *,
         api_key: str,
+        world_part: str,
         model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
-        base_url: str = "api.slng.ai",
+        base_url: str | None = None,
         encoding: str = "linear16",
         sample_rate: int | None = None,
-        region_override: str | None = None,
-        world_part_override: str | None = None,
         provider_key: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
@@ -121,18 +121,19 @@ class SlngTTSService(WebsocketTTSService):
 
         Args:
             api_key: Authentication key for the SLNG API.
+            world_part: Required destination hostname prefix, e.g. ``"eu-west"``
+                (Germany) or ``"eu-north"`` (Finland). Requests go to
+                ``wss://{world_part}.api.slng.ai``. Choose one where your models
+                are provisioned and pass the same value to your STT service.
             model: The TTS model to use. Defaults to "slng/deepgram/aura:2-en".
             voice: Voice identifier for synthesis (e.g. "aura-2-thalia-en").
-            base_url: The API host. Defaults to "api.slng.ai".
+            base_url: Advanced override for a legacy, staging, or custom host,
+                e.g. ``"api.slng.ai"`` for the unprefixed legacy gateway. When
+                supplied it takes precedence and its host is used unchanged — no
+                world part is inserted. Defaults to None (world-part routing).
             encoding: Audio encoding format. One of ``"linear16"``, ``"mp3"``,
                 ``"opus"``, ``"mulaw"``, or ``"alaw"``. Defaults to ``"linear16"``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
-            region_override: Pin requests to a specific datacenter. One of
-                ``"ap-southeast-2"``, ``"eu-north-1"``, ``"us-east-1"``. Sets the
-                ``X-Region-Override`` header (takes precedence over ``world_part_override``).
-            world_part_override: Constrain routing to a broad geographic zone.
-                One of ``"ap"``, ``"eu"``, ``"na"``. Sets the ``X-World-Part-Override``
-                header.
             provider_key: Your own upstream provider API key (BYOK). Sent as the
                 ``X-Slng-Provider-Key`` header on the WebSocket upgrade, so the
                 provider bills your account directly. Only supported on external
@@ -149,6 +150,11 @@ class SlngTTSService(WebsocketTTSService):
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
         """
+        # Validate before the parent constructor allocates anything.
+        resolved_base_url = resolve_base_url(
+            world_part=world_part, base_url=base_url, websocket=True, extra=kwargs
+        )
+
         default_settings = self.Settings(
             model=model,
             voice=voice,
@@ -169,10 +175,8 @@ class SlngTTSService(WebsocketTTSService):
         )
 
         self._api_key = api_key
-        self._base_url = base_url
+        self._base_url = resolved_base_url
         self._encoding = encoding
-        self._region_override = region_override
-        self._world_part_override = world_part_override
         self._provider_key = provider_key
         self._receive_task = None
         self._keepalive_task = None
@@ -311,16 +315,9 @@ class SlngTTSService(WebsocketTTSService):
             logger.debug(f"Connecting to SLNG TTS ({model})")
 
             model_path = quote(model, safe="/:")
-            if "://" in self._base_url:
-                ws_url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
-            else:
-                ws_url = f"wss://{self._base_url}/v1/bridges/unmute/tts/{model_path}"
+            ws_url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
 
             headers: dict[str, str] = {"Authorization": f"Bearer {self._api_key}"}
-            if self._region_override:
-                headers["X-Region-Override"] = self._region_override
-            if self._world_part_override:
-                headers["X-World-Part-Override"] = self._world_part_override
             if self._provider_key:
                 headers["X-Slng-Provider-Key"] = self._provider_key
             self._ready_event.clear()
@@ -758,7 +755,7 @@ class SlngHttpTTSService(TTSService):
     """Text-to-speech service using the SLNG Unified TTS bridge HTTP API.
 
     Performs non-streaming (request/response) synthesis via
-    ``POST https://api.slng.ai/v1/bridges/unmute/tts/{model}``. Each
+    ``POST https://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}``. Each
     ``run_tts`` call issues a single HTTP request and returns the full audio
     body as one ``TTSAudioRawFrame``. Prefer the streaming WebSocket
     :class:`SlngTTSService` for low-latency, interruptible conversational
@@ -778,13 +775,12 @@ class SlngHttpTTSService(TTSService):
         self,
         *,
         api_key: str,
+        world_part: str,
         model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
-        base_url: str = "https://api.slng.ai",
+        base_url: str | None = None,
         aiohttp_session: aiohttp.ClientSession | None = None,
         sample_rate: int | None = None,
-        region_override: str | None = None,
-        world_part_override: str | None = None,
         provider_key: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
@@ -795,19 +791,22 @@ class SlngHttpTTSService(TTSService):
 
         Args:
             api_key: Authentication key for the SLNG API.
+            world_part: Required destination hostname prefix, e.g. ``"eu-west"``
+                (Germany) or ``"eu-north"`` (Finland). Requests go to
+                ``https://{world_part}.api.slng.ai``. Choose one where your
+                models are provisioned.
             model: The TTS model to use. Defaults to "slng/deepgram/aura:2-en".
             voice: Voice identifier for synthesis (e.g. "aura-2-thalia-en").
-            base_url: Full base URL (including scheme) of the SLNG API.
-                Defaults to "https://api.slng.ai".
+            base_url: Advanced override for a legacy, staging, or custom host —
+                a full ``http://``/``https://`` URL, e.g.
+                ``"https://api.slng.ai"`` for the unprefixed legacy gateway. When
+                supplied it takes precedence and its host is used unchanged — no
+                world part is inserted. Defaults to None (world-part routing).
             aiohttp_session: Optional aiohttp ClientSession. If None, one is
                 created in ``start()`` and closed in ``stop()``/``cancel()``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline rate.
                 Applied to non-container (raw PCM) responses; WAV responses use
                 their own embedded sample rate.
-            region_override: Pin requests to a specific datacenter. Sent as the
-                ``region`` query parameter.
-            world_part_override: Constrain routing to a broad geographic zone.
-                Sent as the ``world-part`` query parameter.
             provider_key: Your own upstream provider API key (BYOK). Sent as the
                 ``X-Slng-Provider-Key`` header on each request, so the provider
                 bills your account directly. Only supported on external catalog
@@ -825,6 +824,11 @@ class SlngHttpTTSService(TTSService):
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent TTSService.
         """
+        # Validate before the parent constructor allocates anything.
+        resolved_base_url = resolve_base_url(
+            world_part=world_part, base_url=base_url, websocket=False, extra=kwargs
+        )
+
         default_settings = self.Settings(
             model=model,
             voice=voice,
@@ -844,9 +848,7 @@ class SlngHttpTTSService(TTSService):
         )
 
         self._api_key = api_key
-        self._base_url = base_url
-        self._region_override = region_override
-        self._world_part_override = world_part_override
+        self._base_url = resolved_base_url
         self._provider_key = provider_key
         self._session = aiohttp_session
         self._owns_session = aiohttp_session is None
@@ -929,20 +931,12 @@ class SlngHttpTTSService(TTSService):
             if self._provider_key:
                 headers["X-Slng-Provider-Key"] = self._provider_key
 
-            # The HTTP bridge body accepts only {text, voice}; region/world-part
-            # are query parameters (the WebSocket service uses headers instead).
-            params: dict[str, str] = {}
-            if self._region_override:
-                params["region"] = self._region_override
-            if self._world_part_override:
-                params["world-part"] = self._world_part_override
-
             payload: dict[str, Any] = {"text": text}
             if self._settings.voice:
                 payload["voice"] = str(self._settings.voice)
 
             async with self._session.post(
-                url, json=payload, headers=headers, params=params or None
+                url, json=payload, headers=headers
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()

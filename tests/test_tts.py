@@ -25,11 +25,37 @@ from pipecat.tests.utils import SleepFrame, run_test
 from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
 
 
-def _make_tts():
+# The 13 SLNG destinations from spec.md, plus an unprovisioned prefix and both
+# length boundaries: the adapter validates syntax, not a deployment catalog.
+_DESTINATIONS = (
+    "us-east",
+    "us-west",
+    "br",
+    "eu-west",
+    "eu-north",
+    "gb",
+    "za",
+    "il",
+    "jp",
+    "sg",
+    "id",
+    "in",
+    "au",
+)
+_FUTURE_PREFIXES = ("mars-1", "a", "a" * 63)
+_WORLD_PART = "eu-west"
+
+_TTS_ROUTE = "/v1/bridges/unmute/tts/"
+_DEFAULT_MODEL_PATH = "slng/deepgram/aura:2-en"
+
+
+def _make_tts(**overrides):
+    overrides.setdefault("world_part", _WORLD_PART)
     return SlngTTSService(
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
+        **overrides,
     )
 
 
@@ -60,10 +86,7 @@ async def test_ws_pronunciation_ref_passed_through(
     """Name and ID references reach init config unchanged."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     settings = SlngTTSSettings(pronunciation=pronunciation) if via_settings else None
-    tts = SlngTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
+    tts = _make_tts(
         pronunciation=None if via_settings else pronunciation,
         settings=settings,
     )
@@ -170,6 +193,7 @@ class FakeAiohttpSession:
 
 
 def _make_http_tts(session, **overrides):
+    overrides.setdefault("world_part", _WORLD_PART)
     return SlngHttpTTSService(
         api_key="test-key",
         voice="aura-2-thalia-en",
@@ -177,6 +201,14 @@ def _make_http_tts(session, **overrides):
         aiohttp_session=session,
         **overrides,
     )
+
+
+async def _http_call(session, text="hi", **overrides):
+    """Synthesise once through a fake session and return the recorded request."""
+    tts = _make_http_tts(session, **overrides)
+    async for _ in tts.run_tts(text, "ctx-1"):
+        pass
+    return session.calls[-1]
 
 
 def _make_wav(pcm: bytes, rate: int = 24000) -> bytes:
@@ -209,7 +241,7 @@ async def test_http_posts_request_and_emits_audio():
     # The HTTP bridge body is {text, voice} only — no `config` object (sending
     # one makes the bridge reject the payload with a 400).
     assert "config" not in call["json"]
-    assert call["params"] is None  # no region/world overrides set
+    assert call["params"] is None  # routing lives in the hostname
 
     # A non-container response is passed through as raw PCM unchanged.
     audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
@@ -237,22 +269,78 @@ async def test_http_wav_response_is_decoded():
     assert audio_frames[0].sample_rate == 24000
 
 
-async def test_http_region_world_sent_as_query_params():
-    """region/world-part overrides go in the query string, not headers."""
+@pytest.mark.parametrize("world_part", [*_DESTINATIONS, *_FUTURE_PREFIXES])
+async def test_http_default_host_is_world_part_prefix(world_part):
+    """With no base override the HTTP host is exactly ``{world_part}.api.slng.ai``."""
     session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = _make_http_tts(
-        session, region_override="eu-north-1", world_part_override="eu"
+
+    call = await _http_call(session, world_part=world_part)
+
+    assert call["url"] == (
+        f"https://{world_part}.api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+    )
+    # The hostname carries the routing choice: no query parameter, no body field.
+    assert call["params"] is None
+    assert not {"region", "world-part", "world_part"} & (
+        set(call["json"]) | set(call["headers"])
     )
 
-    await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [
+        (None, "https://in.api.slng.ai"),
+        ("https://api.slng.ai", "https://api.slng.ai"),
+        ("https://gb.api.slng.ai", "https://gb.api.slng.ai"),
+        ("https://IN.API.SLNG.AI.", "https://IN.API.SLNG.AI."),
+        ("http://staging.example:8443/gateway/", "http://staging.example:8443/gateway"),
+    ],
+)
+async def test_http_explicit_base_keeps_supplied_host(base_url, expected_base):
+    """An explicit base overrides world-part host generation, unchanged."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+
+    call = await _http_call(session, world_part="in", base_url=base_url)
+
+    assert call["url"] == f"{expected_base}{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [(None, "https://au.api.slng.ai"), ("https://api.slng.ai", "https://api.slng.ai")],
+)
+async def test_http_base_retained_across_requests_and_model_change(
+    base_url, expected_base
+):
+    """Repeated requests keep the base; only the escaped model route moves."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+    tts = _make_http_tts(session, world_part="au", base_url=base_url)
+
+    async for _ in tts.run_tts("one", "ctx-1"):
+        pass
+    tts._settings.model = "my provider/model:v1"
+    async for _ in tts.run_tts("two", "ctx-2"):
+        pass
+
+    assert [c["url"] for c in session.calls] == [
+        f"{expected_base}{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}",
+        f"{expected_base}{_TTS_ROUTE}my%20provider/model:v1",
+    ]
+
+
+async def test_http_instances_route_independently():
+    """One service's destination never changes another's."""
+    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
+
+    automatic = await _http_call(session, world_part="sg")
+    explicit = await _http_call(
+        session, world_part="sg", base_url="https://api.slng.ai"
     )
 
-    call = session.calls[0]
-    assert call["params"] == {"region": "eu-north-1", "world-part": "eu"}
-    assert "X-Region-Override" not in call["headers"]
-    assert "X-World-Part-Override" not in call["headers"]
+    assert (
+        automatic["url"] == f"https://sg.api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+    )
+    assert explicit["url"] == f"https://api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
 
 
 async def test_http_compressed_format_yields_error():
@@ -293,12 +381,7 @@ async def test_http_non_200_yields_error_frame():
 async def test_ws_update_settings_reconnects(monkeypatch):
     """A changed setting reconnects without clearing unrelated settings."""
     pronunciation = {"mode": "rewrite", "name": "brand-pronunciations"}
-    tts = SlngTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-        pronunciation=pronunciation,
-    )
+    tts = _make_tts(pronunciation=pronunciation)
 
     calls: list = []
 
@@ -341,32 +424,88 @@ async def test_ws_update_settings_noop_does_not_reconnect(monkeypatch):
     assert calls == []
 
 
-async def test_ws_region_and_world_headers_sent(patch_ws):
-    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
-    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
-    tts = SlngTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-        region_override="ap-southeast-2",
-        world_part_override="ap",
+@pytest.mark.parametrize("world_part", [*_DESTINATIONS, *_FUTURE_PREFIXES])
+async def test_ws_default_host_is_world_part_prefix(patch_ws, world_part):
+    """With no base override the WS host is exactly ``{world_part}.api.slng.ai``."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts(world_part=world_part)
+
+    await tts._connect_websocket()
+
+    assert fake.connect_url == (
+        f"wss://{world_part}.api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+    )
+    # The hostname carries the routing choice: no legacy header, no init field.
+    assert list(fake.connect_headers) == ["Authorization"]
+    init = json.loads(fake.sent[0])
+    assert not {"region", "world-part", "world_part"} & (
+        set(init) | set(init["config"])
     )
 
-    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
-    assert fake.connect_headers["X-Region-Override"] == "ap-southeast-2"
-    assert fake.connect_headers["X-World-Part-Override"] == "ap"
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [
+        (None, "wss://in.api.slng.ai"),
+        ("api.slng.ai", "wss://api.slng.ai"),
+        ("wss://api.slng.ai", "wss://api.slng.ai"),
+        # Already prefixed hosts are kept as supplied, matching world_part or not.
+        ("gb.api.slng.ai", "wss://gb.api.slng.ai"),
+        ("in.api.slng.ai", "wss://in.api.slng.ai"),
+        ("wss://GB.API.SLNG.AI.", "wss://GB.API.SLNG.AI."),
+        ("ws://staging.example:8080/gateway/", "ws://staging.example:8080/gateway"),
+    ],
+)
+async def test_ws_explicit_base_keeps_supplied_host(patch_ws, base_url, expected_base):
+    """An explicit base overrides world-part host generation, unchanged."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts(world_part="in", base_url=base_url)
+
+    await tts._connect_websocket()
+
+    assert fake.connect_url == f"{expected_base}{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base"),
+    [(None, "wss://eu-north.api.slng.ai"), ("api.slng.ai", "wss://api.slng.ai")],
+)
+async def test_ws_base_retained_on_reconnect_and_model_change(
+    patch_ws, base_url, expected_base
+):
+    """Reconnects keep the selected base; only the escaped model route moves."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    tts = _make_tts(world_part="eu-north", base_url=base_url)
+
+    await tts._connect_websocket()
+    first_url = fake.connect_url
+
+    tts._websocket = None  # force the reconnect path
+    tts._settings.model = "my provider/model:v1"
+    await tts._connect_websocket()
+
+    assert first_url == f"{expected_base}{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+    assert fake.connect_url == f"{expected_base}{_TTS_ROUTE}my%20provider/model:v1"
+
+
+async def test_ws_instances_route_independently(patch_ws):
+    """One service's destination never changes another's."""
+    fake = patch_ws("pipecat_slng.tts", [])
+    automatic = _make_tts(world_part="jp")
+    explicit = _make_tts(world_part="jp", base_url="api.slng.ai")
+
+    await automatic._connect_websocket()
+    automatic_url = fake.connect_url
+    await explicit._connect_websocket()
+
+    assert automatic_url == f"wss://jp.api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
+    assert fake.connect_url == f"wss://api.slng.ai{_TTS_ROUTE}{_DEFAULT_MODEL_PATH}"
 
 
 async def test_ws_provider_key_header_sent(patch_ws):
     """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
-    tts = SlngTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-        provider_key="my-provider-key",
-    )
+    tts = _make_tts(provider_key="my-provider-key")
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
@@ -387,12 +526,7 @@ async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
     """Route 3 (WS TTS): an external model WITHOUT provider_key sends only
     Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
-    tts = SlngTTSService(
-        api_key="test-key",
-        model="deepgram/aura:2",  # external route — no slng/ prefix
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-    )
+    tts = _make_tts(model="deepgram/aura:2")  # external route — no slng/ prefix
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
