@@ -37,6 +37,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from pipecat_slng._endpoints import resolve_base_url
 from pipecat_slng._errors import connect_error_detail
 
 _DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
@@ -60,7 +61,7 @@ class SlngSTTService(WebsocketSTTService):
     """Speech-to-text service using the SLNG Unmute STT bridge WebSocket API.
 
     Provides real-time speech transcription through a persistent WebSocket
-    connection to ``wss://api.slng.ai/v1/bridges/unmute/stt/{model}``:
+    connection to ``wss://{world_part}.api.slng.ai/v1/bridges/unmute/stt/{model}``:
 
     - Audio is sent as raw binary WebSocket frames (no JSON wrapping).
     - Connection-level config (``sample_rate``, ``encoding``, ``language``,
@@ -78,12 +79,11 @@ class SlngSTTService(WebsocketSTTService):
         self,
         *,
         api_key: str,
+        world_part: str,
         model: str = _DEFAULT_STT_MODEL,
-        base_url: str = "api.slng.ai",
+        base_url: str | None = None,
         encoding: str = "linear16",
         sample_rate: int | None = None,
-        region_override: str | None = None,
-        world_part_override: str | None = None,
         provider_key: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         enable_vad: bool | NotGiven = NOT_GIVEN,
@@ -95,13 +95,18 @@ class SlngSTTService(WebsocketSTTService):
 
         Args:
             api_key: Authentication key for the SLNG API.
+            world_part: Required destination hostname prefix, e.g. ``"eu-west"``
+                (Germany) or ``"eu-north"`` (Finland). Requests go to
+                ``wss://{world_part}.api.slng.ai``. Choose one where your models
+                are provisioned and pass the same value to your TTS service.
             model: The transcription model to use. Defaults to "slng/deepgram/nova:3-en".
-            base_url: The API host (without scheme). Defaults to "api.slng.ai".
+            base_url: Advanced override for a legacy, staging, or custom host,
+                e.g. ``"api.slng.ai"`` for the unprefixed legacy gateway. When
+                supplied it takes precedence and its host is used unchanged — no
+                world part is inserted. Defaults to None (world-part routing).
             encoding: Audio encoding format. One of ``"linear16"``, ``"mp3"``,
                 or ``"opus"``. Defaults to ``"linear16"``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
-            region_override: Pin requests to a specific datacenter.
-            world_part_override: Constrain routing to a broad geographic zone.
             provider_key: Your own upstream provider API key (BYOK). Sent as the
                 ``X-Slng-Provider-Key`` header on the WebSocket upgrade, so the
                 provider bills your account directly. Only supported on external
@@ -118,6 +123,11 @@ class SlngSTTService(WebsocketSTTService):
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketSTTService.
         """
+        # Validate before the parent constructor allocates anything.
+        resolved_base_url = resolve_base_url(
+            world_part=world_part, base_url=base_url, websocket=True, extra=kwargs
+        )
+
         default_settings = self.Settings(
             model=model,
             language=language if is_given(language) else Language.EN,
@@ -137,11 +147,9 @@ class SlngSTTService(WebsocketSTTService):
         )
 
         self._api_key = api_key
-        self._base_url = base_url
+        self._base_url = resolved_base_url
         self._encoding = encoding
         self._receive_task = None
-        self._region_override = region_override
-        self._world_part_override = world_part_override
         self._provider_key = provider_key
         self._ready_event = asyncio.Event()
         self._ready_timeout = 5.0
@@ -309,16 +317,9 @@ class SlngSTTService(WebsocketSTTService):
             if not is_given(model) or not model:
                 model = _DEFAULT_STT_MODEL
             model_path = quote(model, safe="/:")
-            if "://" in self._base_url:
-                ws_url = f"{self._base_url}/v1/bridges/unmute/stt/{model_path}"
-            else:
-                ws_url = f"wss://{self._base_url}/v1/bridges/unmute/stt/{model_path}"
+            ws_url = f"{self._base_url}/v1/bridges/unmute/stt/{model_path}"
 
             headers: dict[str, str] = {"Authorization": f"Bearer {self._api_key}"}
-            if self._region_override:
-                headers["X-Region-Override"] = self._region_override
-            if self._world_part_override:
-                headers["X-World-Part-Override"] = self._world_part_override
             if self._provider_key:
                 headers["X-Slng-Provider-Key"] = self._provider_key
 

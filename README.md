@@ -30,6 +30,10 @@ OPENAI_API_KEY=your_openai_api_key  # only needed for the example bot (LLM)
 
 Copy [`.env.example`](.env.example) to `.env` to get started.
 
+The destination (`world_part`) is **not** an environment variable — it is a
+required constructor parameter you define in code. See
+[Destination routing](#destination-routing-world_part).
+
 ## Usage (streaming WebSocket — recommended)
 
 `SlngSTTService` and `SlngTTSService` run over WebSocket: low-latency, supports
@@ -41,13 +45,17 @@ import os
 
 from pipecat_slng import SlngSTTService, SlngTTSService
 
+world_part = "eu-west"  # Germany; choose where your models are available.
+
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part=world_part,
     model="slng/deepgram/nova:3-en",
 )
 
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part=world_part,
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
 )
@@ -97,6 +105,7 @@ applies the rewrite rules.
 ```python
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="eu-west",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
     pronunciation={"mode": "rewrite", "name": "support-pronunciations"},
@@ -119,6 +128,7 @@ from pipecat_slng import SlngHttpTTSService
 
 tts = SlngHttpTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="eu-west",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
 )
@@ -135,22 +145,94 @@ at the pipeline's sample rate). Compressed responses (MP3/Ogg) yield an
 An `aiohttp.ClientSession` is created internally if you don't pass one; supply
 `aiohttp_session=...` to reuse a shared session.
 
-## Region routing
+## Destination routing (`world_part`)
 
-Both services support gateway region routing via `region_override` (pin to a
-datacenter: `ap-southeast-2` | `eu-north-1` | `us-east-1`) and
-`world_part_override` (broad zone: `ap` | `eu` | `na`). When both are set,
-`region_override` wins. WebSocket services send these as the
-`X-Region-Override` / `X-World-Part-Override` headers; the HTTP service uses
-the `region` / `world-part` query parameters (per the bridge contract).
+Every service requires `world_part`, the hostname prefix of the SLNG
+destination your requests go to. It has no default and no environment fallback:
+
+| Service | Endpoint |
+|---|---|
+| `SlngSTTService` | `wss://{world_part}.api.slng.ai/v1/bridges/unmute/stt/{model}` |
+| `SlngTTSService` | `wss://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}` |
+| `SlngHttpTTSService` | `https://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}` |
+
+Define the value once in your application code and pass it to both services —
+`world_part` is a hostname prefix, never a full hostname, URL, or group name:
 
 ```python
-stt = SlngSTTService(
-    api_key=os.getenv("SLNG_API_KEY"),
-    model="slng/deepgram/nova:3-en",
-    region_override="eu-north-1",
+world_part = "eu-west"  # Germany
+
+stt = SlngSTTService(api_key=slng_api_key, world_part=world_part)
+tts = SlngTTSService(api_key=slng_api_key, world_part=world_part)
+```
+
+### Destinations
+
+`Group` and `Location` are labels for humans; only the world part selects a host.
+
+| World part | Group | Location | Hostname |
+|---|---|---|---|
+| `us-east` | Americas | US East | `us-east.api.slng.ai` |
+| `us-west` | Americas | US West | `us-west.api.slng.ai` |
+| `br` | Americas | Brazil | `br.api.slng.ai` |
+| `eu-west` | Europes | Germany | `eu-west.api.slng.ai` |
+| `eu-north` | Europes | Finland | `eu-north.api.slng.ai` |
+| `gb` | Europes | UK | `gb.api.slng.ai` |
+| `za` | Europes | South Africa | `za.api.slng.ai` |
+| `il` | Europes | Israel | `il.api.slng.ai` |
+| `jp` | Asia | Japan | `jp.api.slng.ai` |
+| `sg` | Asia | Singapore | `sg.api.slng.ai` |
+| `id` | Asia | Indonesia (Jakarta) | `id.api.slng.ai` |
+| `in` | Asia | Mumbai | `in.api.slng.ai` |
+| `au` | Asia | Australia | `au.api.slng.ai` |
+
+Pick one where your model is provisioned. Any syntactically valid prefix
+(1–63 lowercase letters, digits, or hyphens) is accepted so new destinations
+work without a package upgrade — which also means an unprovisioned destination
+fails with a normal connection error. There is **no fallback**: a failing
+destination is never retried against another world part or the unprefixed
+gateway.
+
+### Advanced: an explicit `base_url`
+
+Omit `base_url` for normal use. Supplying it overrides host selection and uses
+your host **unchanged** — no world part is inserted, even if the host already
+has one. `world_part` stays required and validated either way.
+
+```python
+# world_part routing (recommended):
+#   wss://in.api.slng.ai/v1/bridges/unmute/stt/sarvam/saaras:v3
+stt = SlngSTTService(api_key=slng_api_key, world_part="in", model="sarvam/saaras:v3")
+
+# Legacy unprefixed gateway, staging, or a custom host:
+#   wss://api.slng.ai/v1/bridges/unmute/stt/sarvam/saaras:v3
+legacy = SlngSTTService(
+    api_key=slng_api_key,
+    world_part="in",
+    base_url="api.slng.ai",
+    model="sarvam/saaras:v3",
 )
 ```
+
+| Service | Accepted `base_url` |
+|---|---|
+| `SlngSTTService`, `SlngTTSService` | DNS host with optional port and path; bare hosts get `wss://`, or pass `ws://`/`wss://` explicitly |
+| `SlngHttpTTSService` | Full `http://` or `https://` URL with a DNS host and optional port and path |
+
+Credentials, query strings, fragments, IP literals, and malformed ports are
+rejected at construction. An empty or malformed base is an error, never a
+silent switch back to automatic routing.
+
+### Migrating from `region_override` / `world_part_override`
+
+Both settings are removed and now raise `TypeError` with migration guidance
+(including when passed as `None`), so no call silently loses its routing.
+
+1. Pick a world part from the table above where your models are available.
+2. Pass it as `world_part=` to **every** SLNG service. Do not add it to `.env`.
+3. Delete `region_override=` / `world_part_override=`, and delete any
+   `base_url=` you were passing — leaving one in place deliberately bypasses
+   world-part routing.
 
 ## Model routing & bring-your-own-key (BYOK)
 
@@ -182,12 +264,14 @@ See the [BYOK docs](https://docs.slng.ai/execution-layer/byok).
 # same pattern works for any external provider (ElevenLabs, Cartesia, Sarvam, …).
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),            # authenticates you to SLNG
+    world_part="eu-west",                         # destination host
     model="deepgram/nova:3",                      # external route — no slng/ prefix
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),  # your own provider key
 )
 
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="eu-west",
     model="deepgram/aura:2",                      # external route — no slng/ prefix
     voice="aura-2-thalia-en",
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),

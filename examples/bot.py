@@ -14,6 +14,9 @@ Required services:
 - SLNG (STT + TTS) — set SLNG_API_KEY
 - OpenAI (LLM)      — set OPENAI_API_KEY
 
+The destination is chosen in code, not in the environment: edit
+``WORLD_PART`` below to the SLNG world part where your models are provisioned.
+
 Optional:
 - Model routing — set SLNG_STT_MODEL / SLNG_TTS_MODEL (+ SLNG_TTS_VOICE) to
   pick routes; both default to SLNG-hosted ``slng/...`` routes.
@@ -58,6 +61,11 @@ from pipecat_slng import SlngSTTService, SlngTTSService
 
 load_dotenv(override=True)
 
+# The SLNG destination, chosen once here and passed to both speech services.
+# Pick the world part where your models are provisioned: eu-west (Germany),
+# eu-north (Finland), us-east, us-west, br, gb, za, il, jp, sg, id, in, or au.
+WORLD_PART = "eu-west"
+
 
 async def run_bot(transport: BaseTransport):
     """Main bot logic."""
@@ -79,6 +87,7 @@ async def run_bot(transport: BaseTransport):
 
     stt = SlngSTTService(
         api_key=slng_api_key,
+        world_part=WORLD_PART,
         model=stt_model,
         provider_key=provider_key,
     )
@@ -87,6 +96,7 @@ async def run_bot(transport: BaseTransport):
     # Swap SLNG_TTS_MODEL to switch route. For non-streaming HTTP, see SlngHttpTTSService.
     tts = SlngTTSService(
         api_key=slng_api_key,
+        world_part=WORLD_PART,
         model=tts_model,
         voice=tts_voice,
         provider_key=provider_key,
