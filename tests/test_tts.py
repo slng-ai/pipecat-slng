@@ -24,6 +24,8 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     TTSStoppedFrame,
 )
+from pipecat.observers.base_observer import FramePushed
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
 
 from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
@@ -1095,64 +1097,250 @@ async def test_tts_rejects_per_fragment_contexts_before_connecting(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Warm-standby measurement harness: offline check of its derivation
+# Warm-standby measurement harness: offline qualification of its derivation
 # ---------------------------------------------------------------------------
+#
+# Pure bookkeeping over a synthetic event log, so it belongs offline rather than
+# behind the live gate in ``test_live_smoke.py``, whose module mark would skip it
+# in CI. The harness has to be trustworthy before its numbers mean anything: an
+# earlier version derived a negative request-to-text span from a delayed
+# observer, passed a batch in which nothing completed, and reported zero live
+# connections with a socket still open.
 
 
-async def test_measurement_spans_pair_requests_with_their_own_text():
-    """The live measurement's span derivation attributes each utterance correctly.
+class _FakeService:
+    """Clock holder and frame-identity sentinel for a scripted batch."""
 
-    This is pure bookkeeping over a synthetic event log, so it belongs offline
-    rather than behind the live gate in ``test_live_smoke.py``, whose module
-    mark would skip it in CI. It exists because the derivation was wrong once:
-    pairing a request to the first text send *at or after* its timestamp
-    dropped every utterance after the first, since Pipecat dispatches async
-    ``on_tts_request`` handlers as tasks and their timestamp can land after the
-    text is already on the wire.
+    def __init__(self):
+        """Start the scripted clock at zero."""
+        self.seconds = 0.0
+
+    def get_clock(self):
+        """Stand in for the pipeline clock the harness reads."""
+        return self
+
+    def get_time(self) -> int:
+        """Elapsed nanoseconds, as ``SystemClock`` reports them."""
+        return int(self.seconds * 1e9)
+
+
+async def _replay(script, texts):
+    """Replay a scripted batch through the real measurement helpers.
+
+    Each entry is ``(at, kind, payload)``. ``wire`` and ``send`` entries advance
+    the scripted clock, since those are recorded by code running on the wire's
+    own timeline. Frame entries do not: their ``at`` is the pipeline timestamp
+    the frame was stamped with, so listing one out of order models an observer
+    that was notified late.
     """
-    from test_live_smoke import _WireLog, _spans
+    from test_live_smoke import _TurnObserver, _WireLog
 
-    log = _WireLog()
-    # Utterance 0 waits on the initial handshake; utterance 1 reuses the socket;
-    # utterance 2 is requested but its text never reaches the wire.
-    log.events = [
-        (0.0, 1, "connect_start"),
-        (1.0, 1, "connect_done"),
-        (1.0, 1, "send:init"),
-        (1.4, 1, "recv:ready"),
-        (1.4, 1, "send:text"),
-        (1.7, 1, "audio"),
-        (1.8, 1, "audio"),
-        (2.0, 1, "recv:audio_end"),
-        (5.0, 1, "send:text"),
-        (5.2, 1, "audio"),
-        (5.5, 1, "recv:flushed"),
+    # Any: the harness only ever reads the clock off this and compares frame
+    # source/destination against it by identity.
+    service: Any = _FakeService()
+    other: Any = _FakeService()  # the processor on the far side of each push
+    log = _WireLog(service)
+    observer = _TurnObserver(service, texts)
+    turns: list[dict] = []
+
+    for at, kind, payload in script:
+        stamp = int(at * 1e9)
+        if kind == "wire":
+            service.seconds = at
+            name, nbytes = payload if isinstance(payload, tuple) else (payload, 0)
+            log.mark(1, name, nbytes)
+            continue
+        if kind == "send":
+            service.seconds = at
+            index, context_id, ok = payload
+            turns.append(
+                {
+                    "index": index,
+                    "context_id": context_id,
+                    "attempt_at": at,
+                    "sent_ok": ok,
+                }
+            )
+            continue
+
+        frame: Any
+        source, destination = service, other
+        if kind == "request":
+            frame, source, destination = TTSSpeakFrame(text=payload), other, service
+        elif kind == "audio":
+            context_id, nbytes = payload
+            frame = TTSAudioRawFrame(
+                audio=b"\x00" * nbytes,
+                sample_rate=24000,
+                num_channels=1,
+                context_id=context_id,
+            )
+        elif kind == "stop":
+            frame = TTSStoppedFrame(context_id=payload)
+        else:
+            frame = ErrorFrame(error=payload)
+        await observer.on_push_frame(
+            FramePushed(
+                source=source,
+                destination=destination,
+                frame=frame,
+                direction=FrameDirection.DOWNSTREAM,
+                timestamp=stamp,
+            )
+        )
+
+    from test_live_smoke import _spans
+
+    return _spans(turns, observer, log, texts), observer, log
+
+
+def _one_turn(
+    *,
+    sent_ok: bool = True,
+    text_send: bool = True,
+    audio: bool = True,
+    terminal: str | None = "recv:audio_end",
+    stop: bool = True,
+    received: int = 400,
+    emitted: int = 400,
+) -> list:
+    """A single complete turn, with any one part missing or corrupted."""
+    script: list[tuple[float, str, Any]] = [
+        (0.0, "wire", "connect_start"),
+        (0.2, "wire", "open"),
+        (0.2, "wire", "send:init"),
+        (0.4, "wire", "recv:ready"),
+        (0.3, "request", "one"),
+        (0.45, "send", (0, "ctx-a", sent_ok)),
     ]
-    rows = _spans([1.1, 4.9, 9.0], ["ctx-a", "ctx-b", "ctx-c"], log)
+    if text_send:
+        script.append((0.5, "wire", "send:text"))
+    if audio:
+        script.append((0.8, "wire", ("audio", received)))
+    if terminal:
+        script.append((1.0, "wire", terminal))
+    if audio:
+        script.append((1.05, "audio", ("ctx-a", emitted)))
+    if stop:
+        script.append((1.1, "stop", "ctx-a"))
+    return script
 
-    assert [r["context_id"] for r in rows] == ["ctx-a", "ctx-b", "ctx-c"]
 
-    # Utterance 0: waited on readiness, and its audio is its own.
-    assert rows[0]["request_to_text"] == pytest.approx(0.3)
+async def test_measurement_qualification():
+    """The harness must reject a batch it cannot actually account for.
+
+    One scenario over the real helpers, covering the ways the previous version
+    reported a plausible number for something it had not observed: a delayed
+    observer notification, a send that never reached the wire, audio that
+    belongs to another context, a turn with no terminal or no downstream
+    completion, a reported service error, and a receive loop cancelled while its
+    socket was still open.
+    """
+    texts = ["one", "two", "three"]
+
+    # --- healthy pair with a missing middle send -----------------------------
+    #
+    # Utterance 0's request is stamped at 0.3 but replayed after the readiness
+    # events, the way a busy observer is notified late; utterance 1 is requested
+    # and never reaches run_tts; utterance 2 is complete. Utterance 0 must keep
+    # its own spans, utterance 1 must stay absent rather than inherit them, and
+    # utterance 2's audio must not be credited backwards.
+    rows, observer, log = await _replay(
+        [
+            (0.0, "wire", "connect_start"),
+            (0.2, "wire", "open"),
+            (0.2, "wire", "send:init"),
+            (0.4, "wire", "recv:ready"),
+            (0.3, "request", "one"),
+            (0.45, "send", (0, "ctx-a", True)),
+            (0.5, "wire", "send:text"),
+            (0.8, "wire", ("audio", 400)),
+            (1.0, "wire", "recv:audio_end"),
+            (1.05, "audio", ("ctx-a", 400)),
+            (1.1, "stop", "ctx-a"),
+            (2.0, "request", "two"),
+            (3.0, "request", "three"),
+            (3.1, "send", (2, "ctx-c", True)),
+            (3.2, "wire", "send:text"),
+            (3.5, "wire", ("audio", 900)),
+            (3.7, "wire", "recv:flushed"),
+            (3.75, "audio", ("ctx-c", 900)),
+            (3.8, "stop", "ctx-c"),
+        ],
+        texts,
+    )
+
+    assert [r["valid"] for r in rows] == [True, False, True]
+    # Timestamps, not delivery order: replaying the request last must not make
+    # its request->text span negative or drag the setup events into it.
+    assert rows[0]["request_to_text"] == pytest.approx(0.2)
     assert rows[0]["text_to_audio"] == pytest.approx(0.3)
-    assert rows[0]["request_to_audio"] == pytest.approx(0.6)
+    assert rows[0]["request_to_audio"] == pytest.approx(0.5)
     assert rows[0]["foreground_setup"] == ["recv:ready"]
-    assert rows[0]["terminal"] == ["recv:audio_end"]
-    # No previous utterance to have waited on.
+    assert rows[0]["terminal"] == "recv:audio_end"
     assert rows[0]["prior_wait"] is None
+    assert rows[0]["actual_gap"] is None
+    assert rows[0]["received_bytes"] == rows[0]["emitted_bytes"] == 400
 
-    # Utterance 1: paired with the *second* text send despite its request
-    # timestamp sitting before it, with no setup in the foreground.
-    assert rows[1]["request_to_text"] == pytest.approx(0.1)
-    assert rows[1]["text_to_audio"] == pytest.approx(0.2)
-    assert rows[1]["foreground_setup"] == []
-    assert rows[1]["terminal"] == ["recv:flushed"]
-    # Waiting on the previous utterance is reported apart from setup: 4.9 - 1.8.
-    assert rows[1]["prior_wait"] == pytest.approx(3.1)
+    assert rows[1]["invalid_reason"] == "0 sends claimed this text"
+    assert rows[1]["request_to_text"] is None
+    assert rows[1]["text_to_audio"] is None
+    assert rows[1]["request_to_audio"] is None
+    assert rows[1]["context_id"] is None
 
-    # Utterance 2 never sent text: every span stays absent rather than zero, and
-    # the earlier utterance's audio is not credited to it.
-    assert rows[2]["request_to_text"] is None
-    assert rows[2]["text_to_audio"] is None
-    assert rows[2]["request_to_audio"] is None
-    assert rows[2]["terminal"] == []
+    assert rows[2]["request_to_text"] == pytest.approx(0.2)
+    assert rows[2]["received_bytes"] == rows[2]["emitted_bytes"] == 900
+    # Waiting on the previous utterance is reported apart from setup: 3.0 - 0.8.
+    assert rows[2]["prior_wait"] == pytest.approx(2.2)
+    # Turn 1 never completed, so there is no completion to measure the gap from.
+    assert rows[2]["actual_gap"] is None
+
+    # --- each way a single turn fails to qualify -----------------------------
+    rows, _, _ = await _replay(_one_turn(), ["one"])
+    assert rows[0]["valid"] and rows[0]["terminal_to_stop"] == pytest.approx(0.1)
+
+    cases: list[tuple[dict[str, Any], str]] = [
+        ({"sent_ok": False}, "send failed or errored"),
+        ({"text_send": False}, "no text reached the wire"),
+        ({"audio": False}, "no audio for this turn"),
+        # A segment marker is not the utterance's terminal.
+        ({"terminal": "recv:segment_end"}, "no terminal message"),
+        ({"terminal": None}, "no terminal message"),
+        # A terminal on the wire with nothing pushed downstream is the defect
+        # this feature fixes; it must not score as a completed utterance.
+        ({"stop": False}, "no downstream completion"),
+        ({"emitted": 250}, "received 400 bytes but emitted 250 for this context"),
+    ]
+    for mutation, reason in cases:
+        rows, _, _ = await _replay(_one_turn(**mutation), ["one"])
+        assert not rows[0]["valid"], f"{mutation} should not qualify"
+        assert rows[0]["invalid_reason"] == reason, mutation
+
+    # --- service errors are carried, not swallowed ---------------------------
+    _, observer, _ = await _replay(
+        _one_turn() + [(1.2, "error", "backend_connection_failed")], ["one"]
+    )
+    assert observer.errors == ["backend_connection_failed"]
+
+    # --- a cancelled receive loop is not a closed socket ---------------------
+    from conftest import FakeWebSocket
+    from test_live_smoke import _TimedSocket, _WireLog
+
+    service = _FakeService()
+    log = _WireLog(service)
+    inner = FakeWebSocket([b"\x01\x02"])
+    socket = _TimedSocket(inner, log, log.reserve())
+    log.sockets.append(socket)
+
+    stream = socket.__aiter__()
+    assert await stream.__anext__() == b"\x01\x02"
+    await stream.aclose()  # the service cancels its receive task
+    names = [name for _, _, name, _ in log.events]
+    assert "recv_end" in names and "closed" not in names
+    # Still owned: reserving a replacement while it lives raises the peak.
+    log.reserve()
+    assert log.peak_owned == 2
+
+    await socket.close()
+    assert "closed" in [name for _, _, name, _ in log.events]
+    assert socket.closed_state is State.CLOSED
