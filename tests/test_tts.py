@@ -14,7 +14,16 @@ from typing import Any
 
 import pytest
 from websockets.protocol import State
-from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    ErrorFrame,
+    InterruptionFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
+    TTSAudioRawFrame,
+    TTSSpeakFrame,
+    TTSStoppedFrame,
+)
 from pipecat.tests.utils import SleepFrame, run_test
 
 from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
@@ -742,3 +751,344 @@ async def test_keepalive_survives_expected_close_reconnect(monkeypatch):
         "keepalive died: no keepalive on the replacement socket after a send "
         "error + per-utterance reconnect"
     )
+
+
+# ---------------------------------------------------------------------------
+# Terminal completion: one stop per utterance, on either terminal form
+# ---------------------------------------------------------------------------
+#
+# Every scenario below asserts what a consumer sees — audio, then exactly one
+# matching TTSStoppedFrame — and finishes well inside the 3s context inactivity
+# fallback. With push_stop_frames=False that fallback cannot emit a stop at all,
+# so any stop observed here is protocol-driven.
+
+
+def _sent_types(fake) -> list[str]:
+    return [json.loads(s).get("type") for s in fake.sent if isinstance(s, str)]
+
+
+async def _await_sent(fake, kind: str, count: int = 1, timeout: float = 3.0):
+    """Block until ``count`` client→server messages of ``kind`` are on the wire."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if _sent_types(fake).count(kind) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {count} {kind!r} message(s)")
+
+
+async def _await_sockets(fakes: list, count: int, timeout: float = 3.0):
+    """Block until ``count`` connections have been opened."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(fakes) < count and loop.time() < deadline:
+        await asyncio.sleep(0.01)
+    assert len(fakes) >= count, f"expected {count} connections, saw {len(fakes)}"
+
+
+def _stops(frames) -> list[TTSStoppedFrame]:
+    return [f for f in frames if isinstance(f, TTSStoppedFrame)]
+
+
+def _audio(frames) -> list[TTSAudioRawFrame]:
+    return [f for f in frames if isinstance(f, TTSAudioRawFrame)]
+
+
+def _collect_sockets(monkeypatch) -> list:
+    """Patch the TTS connect to record every socket it hands out."""
+    from conftest import FakeWebSocket
+
+    fakes: list[FakeWebSocket] = []
+
+    async def _connect(url, **kwargs):
+        fake = FakeWebSocket([json.dumps({"type": "ready"})])
+        fakes.append(fake)
+        return fake
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", _connect)
+    return fakes
+
+
+@pytest.mark.parametrize(
+    "terminals",
+    [
+        ["audio_end"],
+        ["flushed"],
+        ["audio_end", "audio_end"],
+        ["flushed", "flushed"],
+        ["audio_end", "flushed"],
+        ["flushed", "audio_end"],
+    ],
+    ids=["audio_end", "flushed", "audio_end-x2", "flushed-x2", "both", "both-reversed"],
+)
+async def test_tts_terminal_completion(patch_ws, terminals):
+    """Either terminal form finishes the utterance exactly once, after its audio.
+
+    The bridge can end a turn with `audio_end` alone and keep the connection
+    open — Deepgram and Gradium routes both translate their native completion to
+    it. Recognising only `flushed` left those utterances with no downstream
+    completion at all. A repeated terminal, or the other form arriving too, must
+    not add a second one.
+    """
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+    audio = b"\x21\x43" * 100
+
+    async def serve():
+        await _await_sent(fake, "flush")
+        await fake.feed(audio)
+        for terminal in terminals:
+            await fake.feed(json.dumps({"type": terminal}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts, frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.5)]
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    stops, audio_frames = _stops(down), _audio(down)
+    assert [f.audio for f in audio_frames] == [audio]
+    assert len(stops) == 1
+    assert down.index(stops[0]) > down.index(audio_frames[-1])
+    assert stops[0].context_id == audio_frames[0].context_id
+    assert not [f for f in up if isinstance(f, ErrorFrame)]
+
+
+async def test_tts_fragments_complete_once_at_turn_end(patch_ws):
+    """A multi-fragment turn is one utterance: no early stop, no truncated audio.
+
+    `segment_end` marks a provider segment, not the end of the turn, and the
+    turn's own terminal only counts once its final flush has been sent.
+    """
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+    first, second = b"\x01\x02" * 50, b"\x03\x04" * 50
+
+    async def serve():
+        # Two sentences on the wire with the turn still open: the aggregator
+        # holds the last one back until the response ends.
+        await _await_sent(fake, "text", count=2)
+        await fake.feed(first)
+        await fake.feed(json.dumps({"type": "segment_end"}))
+        # Before the turn's own flush, so it can only be ending a segment.
+        await fake.feed(json.dumps({"type": "audio_end"}))
+        await _await_sent(fake, "flush")
+        await fake.feed(second)
+        await fake.feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts,
+            frames_to_send=[
+                LLMFullResponseStartFrame(),
+                TextFrame("Hello there. "),
+                TextFrame("How are you? "),
+                TextFrame("Fine thanks. "),
+                SleepFrame(sleep=0.3),
+                LLMFullResponseEndFrame(),
+                SleepFrame(sleep=0.5),
+            ],
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    stops, audio_frames = _stops(down), _audio(down)
+    assert _sent_types(fake).count("text") == 3
+    assert [f.audio for f in audio_frames] == [first, second]
+    assert len({f.context_id for f in audio_frames}) == 1
+    assert len(stops) == 1
+    assert down.index(stops[0]) > down.index(audio_frames[-1])
+    assert not [f for f in up if isinstance(f, ErrorFrame)]
+
+
+async def test_tts_pipelined_utterances_keep_their_own_audio(patch_ws):
+    """Two turns in flight each complete against their own synthesis context.
+
+    Attribution used to follow Pipecat's playback cursor, which lags synthesis:
+    with the first utterance still draining downstream, the second one's audio
+    was appended behind the first context's end marker and never played.
+    """
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+    first, second = b"\x11\x11" * 100, b"\x22\x22" * 100
+
+    async def serve():
+        await _await_sent(fake, "flush", count=2)  # both turns submitted
+        await fake.feed(first)
+        await fake.feed(json.dumps({"type": "audio_end"}))
+        await fake.feed(second)
+        await fake.feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts,
+            frames_to_send=[
+                TTSSpeakFrame(text="one"),
+                TTSSpeakFrame(text="two"),
+                SleepFrame(sleep=0.8),
+            ],
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    stops, audio_frames = _stops(down), _audio(down)
+    assert [f.audio for f in audio_frames] == [first, second]
+    ctx_a, ctx_b = audio_frames[0].context_id, audio_frames[1].context_id
+    assert ctx_a != ctx_b
+    assert [s.context_id for s in stops] == [ctx_a, ctx_b]
+    assert not [f for f in up if isinstance(f, ErrorFrame)]
+
+
+async def test_tts_completion_keeps_the_socket_open(monkeypatch):
+    """Completing an utterance leaves the connection available for the next one."""
+    fakes = _collect_sockets(monkeypatch)
+    tts = _make_tts()
+
+    async def serve():
+        await _await_sockets(fakes, 1)
+        for turn in (1, 2):
+            await _await_sent(fakes[0], "flush", count=turn)
+            await fakes[0].feed(bytes([turn]) * 100)
+            await fakes[0].feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts,
+            frames_to_send=[
+                TTSSpeakFrame(text="one"),
+                SleepFrame(sleep=0.3),
+                TTSSpeakFrame(text="two"),
+                SleepFrame(sleep=0.5),
+            ],
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    assert len(fakes) == 1, "completion must not cost a reconnect"
+    assert [f.audio for f in _audio(down)] == [b"\x01" * 100, b"\x02" * 100]
+    assert len(_stops(down)) == 2
+    assert not [f for f in up if isinstance(f, ErrorFrame)]
+
+
+async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch):
+    """An abandoned turn's stream is dropped before a new turn uses it.
+
+    `cleared` is not a portable drain barrier across gateway runtimes, so audio
+    the provider had already queued for the abandoned turn can still arrive.
+    Keeping that stream would credit it to the next utterance.
+    """
+    fakes = _collect_sockets(monkeypatch)
+    tts = _make_tts()
+    stale, fresh = b"\x99\x99" * 100, b"\x33\x33" * 100
+
+    async def serve():
+        await _await_sockets(fakes, 1)
+        await _await_sent(fakes[0], "clear")
+        await _await_sockets(fakes, 2)
+        await _await_sent(fakes[1], "flush")
+        await fakes[0].feed(stale)  # late output from the abandoned stream
+        await fakes[1].feed(fresh)
+        await fakes[1].feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, _ = await run_test(
+            tts,
+            frames_to_send=[
+                TTSSpeakFrame(text="interrupt me"),
+                SleepFrame(sleep=0.2),
+                InterruptionFrame(),
+                SleepFrame(sleep=0.2),
+                TTSSpeakFrame(text="after"),
+                SleepFrame(sleep=0.6),
+            ],
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    assert [f.audio for f in _audio(down)] == [fresh]
+    assert len(_stops(down)) == 1
+
+
+async def test_tts_zero_audio_terminal_still_completes_the_context(patch_ws):
+    """A terminal with no audio closes the context so Pipecat can report it."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    async def serve():
+        await _await_sent(fake, "flush")
+        await fake.feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts, frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.5)]
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    assert not _audio(down)
+    assert len(_stops(down)) == 1
+    errors = [f for f in up if isinstance(f, ErrorFrame)]
+    assert errors and "no audio" in errors[0].error
+
+
+async def test_tts_missing_terminal_fabricates_no_completion(patch_ws):
+    """Without a terminal message there is no completion — only the fallback."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+    audio = b"\x44\x44" * 100
+
+    async def serve():
+        await _await_sent(fake, "flush")
+        await fake.feed(audio)
+
+    server = asyncio.create_task(serve())
+    try:
+        down, _ = await run_test(
+            tts, frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.5)]
+        )
+    finally:
+        await asyncio.wait_for(server, timeout=5)
+
+    assert [f.audio for f in _audio(down)] == [audio]
+    assert not _stops(down)
+
+
+async def test_tts_empty_input_creates_no_utterance(patch_ws):
+    """Text that never reaches synthesis produces neither audio nor a stop."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    down, _ = await run_test(
+        tts, frames_to_send=[TTSSpeakFrame(text="   "), SleepFrame(sleep=0.3)]
+    )
+
+    assert "text" not in _sent_types(fake)
+    assert not _audio(down)
+    assert not _stops(down)
+
+
+async def test_tts_rejects_per_fragment_contexts_before_connecting(monkeypatch):
+    """Explicit per-fragment contexts are refused, not silently overridden.
+
+    The bridge returns one unlabelled stream per input turn, so fragment-sized
+    contexts have nothing to attribute that stream to.
+    """
+    fakes = _collect_sockets(monkeypatch)
+
+    with pytest.raises(ValueError, match="reuse_context_id_within_turn"):
+        SlngTTSService(
+            api_key="test-key",
+            voice="aura-2-thalia-en",
+            sample_rate=24000,
+            reuse_context_id_within_turn=False,
+        )
+
+    assert not fakes, "the configuration must be rejected before any connection"
