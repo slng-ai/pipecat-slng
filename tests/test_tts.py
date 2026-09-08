@@ -1092,3 +1092,67 @@ async def test_tts_rejects_per_fragment_contexts_before_connecting(monkeypatch):
         )
 
     assert not fakes, "the configuration must be rejected before any connection"
+
+
+# ---------------------------------------------------------------------------
+# Warm-standby measurement harness: offline check of its derivation
+# ---------------------------------------------------------------------------
+
+
+async def test_measurement_spans_pair_requests_with_their_own_text():
+    """The live measurement's span derivation attributes each utterance correctly.
+
+    This is pure bookkeeping over a synthetic event log, so it belongs offline
+    rather than behind the live gate in ``test_live_smoke.py``, whose module
+    mark would skip it in CI. It exists because the derivation was wrong once:
+    pairing a request to the first text send *at or after* its timestamp
+    dropped every utterance after the first, since Pipecat dispatches async
+    ``on_tts_request`` handlers as tasks and their timestamp can land after the
+    text is already on the wire.
+    """
+    from test_live_smoke import _WireLog, _spans
+
+    log = _WireLog()
+    # Utterance 0 waits on the initial handshake; utterance 1 reuses the socket;
+    # utterance 2 is requested but its text never reaches the wire.
+    log.events = [
+        (0.0, 1, "connect_start"),
+        (1.0, 1, "connect_done"),
+        (1.0, 1, "send:init"),
+        (1.4, 1, "recv:ready"),
+        (1.4, 1, "send:text"),
+        (1.7, 1, "audio"),
+        (1.8, 1, "audio"),
+        (2.0, 1, "recv:audio_end"),
+        (5.0, 1, "send:text"),
+        (5.2, 1, "audio"),
+        (5.5, 1, "recv:flushed"),
+    ]
+    rows = _spans([1.1, 4.9, 9.0], ["ctx-a", "ctx-b", "ctx-c"], log)
+
+    assert [r["context_id"] for r in rows] == ["ctx-a", "ctx-b", "ctx-c"]
+
+    # Utterance 0: waited on readiness, and its audio is its own.
+    assert rows[0]["request_to_text"] == pytest.approx(0.3)
+    assert rows[0]["text_to_audio"] == pytest.approx(0.3)
+    assert rows[0]["request_to_audio"] == pytest.approx(0.6)
+    assert rows[0]["foreground_setup"] == ["recv:ready"]
+    assert rows[0]["terminal"] == ["recv:audio_end"]
+    # No previous utterance to have waited on.
+    assert rows[0]["prior_wait"] is None
+
+    # Utterance 1: paired with the *second* text send despite its request
+    # timestamp sitting before it, with no setup in the foreground.
+    assert rows[1]["request_to_text"] == pytest.approx(0.1)
+    assert rows[1]["text_to_audio"] == pytest.approx(0.2)
+    assert rows[1]["foreground_setup"] == []
+    assert rows[1]["terminal"] == ["recv:flushed"]
+    # Waiting on the previous utterance is reported apart from setup: 4.9 - 1.8.
+    assert rows[1]["prior_wait"] == pytest.approx(3.1)
+
+    # Utterance 2 never sent text: every span stays absent rather than zero, and
+    # the earlier utterance's audio is not credited to it.
+    assert rows[2]["request_to_text"] is None
+    assert rows[2]["text_to_audio"] is None
+    assert rows[2]["request_to_audio"] is None
+    assert rows[2]["terminal"] == []
