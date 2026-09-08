@@ -60,6 +60,8 @@ to [Semantic Versioning](https://semver.org/).
   error matrix, including credential-safe URL parser errors. Live smoke tests
   skip cleanly without credentials; STT checks require server readiness and no
   error frames so a rejected connection cannot pass with an empty transcript.
+  Offline tests disable Pipecat's unused tokenizer warmup, avoiding NLTK
+  imports/downloads inside the test helper's startup deadline.
 
 ### Fixed
 

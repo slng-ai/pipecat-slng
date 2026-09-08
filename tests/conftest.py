@@ -20,6 +20,16 @@ from websockets.protocol import State
 _SENTINEL = object()
 
 
+@pytest.fixture(autouse=True)
+def disable_offline_tokenizer_warmup(monkeypatch, request):
+    """Keep unused NLTK imports/downloads outside offline pipeline startup."""
+    # Offline TTS cases send TTSSpeakFrame and do not tokenize sentences.
+    if request.node.get_closest_marker("live") is None:
+        monkeypatch.setattr(
+            "pipecat.pipeline.worker.warm_deferred_imports", lambda: None
+        )
+
+
 class FakeWebSocket:
     """Async-iterable stand-in for a ``websockets`` client connection."""
 
