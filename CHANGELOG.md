@@ -28,8 +28,8 @@ to [Semantic Versioning](https://semver.org/).
 
 - Add completion, pipelined-turn, recovery, and interruption regression coverage,
   plus opt-in Sarvam TTS/STT speech checks and repeated latency measurements.
-  Measurement qualification remains under review; no latency improvement or warm
-  standby benefit is claimed. No gateway, STT runtime, or HTTP TTS changes.
+  Verified against Pipecat 1.8.0. No latency improvement or warm standby benefit
+  is claimed. No gateway, STT runtime, or HTTP TTS changes.
 
 ## [0.5.1] - 2026-08-27
 

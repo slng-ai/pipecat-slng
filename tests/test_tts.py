@@ -2140,3 +2140,130 @@ async def test_reconciled_cancel_during_init_closes_acquired_socket(monkeypatch)
         await connecting
     assert socket.state is State.CLOSED
     assert tts._websocket is None
+
+
+async def test_old_receive_close_preserves_on_demand_replacement(monkeypatch):
+    """An old EOF cannot close B's connection or prematurely end its context."""
+    from conftest import FakeWebSocket
+
+    fakes = []
+    between, finished = asyncio.Event(), asyncio.Event()
+
+    async def connect(*args, **kwargs):
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        fakes.append(ws)
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = _make_tts()
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not between.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="B")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.2)
+
+    async def server():
+        await _await_sockets(fakes, 1)
+        await _await_sent(fakes[0], "flush")
+        await fakes[0].feed(b"\x11\x22" * 100)
+        await fakes[0].feed(json.dumps({"type": "audio_end"}))
+        while tts._wire:
+            await asyncio.sleep(0.001)
+        # The transport is closed before the receive task consumes its EOF.
+        fakes[0].state = State.CLOSED
+        between.set()
+        await _await_sockets(fakes, 2)
+        await fakes[0].close()
+        await asyncio.sleep(0.05)
+        await _await_sent(fakes[-1], "flush")
+        await fakes[-1].feed(b"\x33\x44" * 100)
+        await fakes[-1].feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    task = asyncio.create_task(server())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 10)
+        await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(fakes) == 2
+    assert len(_audio(down)) == len(_stops(down)) == 2
+    assert not [f.error for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert all(ws.state is State.CLOSED for ws in fakes)
+
+
+async def test_failed_on_demand_replacement_keeps_later_speech_receivable(monkeypatch):
+    """A failed replacement must not leave a completed receive-task reference."""
+    from conftest import FakeWebSocket
+
+    sockets = []
+    attempts = 0
+    closed, failed, next_turn, finished = (asyncio.Event() for _ in range(4))
+
+    async def connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            failed.set()
+            raise OSError("temporary connection failure")
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = _make_tts()
+    first, last = b"\x11\x22" * 100, b"\x33\x44" * 100
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not closed.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="B loses its connection")
+        while not next_turn.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="C still speaks")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.2)
+
+    async def server():
+        await _await_sockets(sockets, 1)
+        await _await_sent(sockets[0], "flush")
+        await sockets[0].feed(first)
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+        while tts._wire:
+            await asyncio.sleep(0.001)
+        sockets[0].state = State.CLOSED
+        closed.set()
+        await failed.wait()
+        await sockets[0].close()
+        # Allow either normal recovery or the buggy receiver exit before C.
+        while len(sockets) < 2 and not tts._receive_task.done():
+            await asyncio.sleep(0.001)
+        next_turn.set()
+        await _await_sockets(sockets, 2)
+        await _await_sent(sockets[1], "flush", timeout=7)
+        await sockets[1].feed(last)
+        await sockets[1].feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    task = asyncio.create_task(server())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 12)
+        await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert [f.audio for f in _audio(down)] == [first, last]
+    assert [f.context_id for f in _stops(down)] == [f.context_id for f in _audio(down)]
+    assert any(
+        "temporary connection failure" in f.error
+        for f in [*down, *up]
+        if isinstance(f, ErrorFrame)
+    )
+    assert all(ws.state is State.CLOSED for ws in sockets)

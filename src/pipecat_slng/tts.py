@@ -225,6 +225,7 @@ class SlngTTSService(WebsocketTTSService):
         # Socket we replaced ourselves, so the receive loop keeps going on the
         # replacement instead of treating the close as a failure.
         self._retiring: Any = None
+        self._receiving_socket: Any = None
         self._connect_lock = asyncio.Lock()
         self._session_dies_per_utterance = False
         self._pending_resend: _WireTurn | None = None
@@ -288,6 +289,7 @@ class SlngTTSService(WebsocketTTSService):
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
+        self._receiving_socket = None
 
         async with self._connect_lock:
             await self._close_retiring_socket()
@@ -514,26 +516,51 @@ class SlngTTSService(WebsocketTTSService):
 
         Unexpected closes (flag unset) keep the full base class behavior.
         """
-        if self._retiring is not None:
-            async with self._connect_lock:
+        async with self._connect_lock:
+            if self._retiring is not None:
                 await self._close_retiring_socket()
                 self._retiring = None
                 await self._call_event_handler("on_disconnected")
                 await self._connect_websocket_locked()
-            return not self._disconnecting and self._websocket is not None
+                return not self._disconnecting and self._websocket is not None
 
-        if self._expect_server_close and not self._disconnecting:
-            self._expect_server_close = False
-            armed_by = self._expect_server_close_reason
-            self._expect_server_close_reason = None
-            logger.debug(
-                f"{self}: expected per-utterance server close "
-                f"(armed by {armed_by}), reconnecting"
-            )
-            await self._disconnect_websocket()
-            await self._connect_websocket()
-            return True  # receive loop continues on the new socket
+            if (
+                self._websocket is not None
+                and self._receiving_socket is not None
+                and self._receiving_socket is not self._websocket
+            ):
+                # run_tts may already have replaced a CLOSED transport before its
+                # receiver consumes EOF. The old callback owns no part of B.
+                return not self._disconnecting and self._websocket is not None
+
+            if self._expect_server_close and not self._disconnecting:
+                logger.debug(
+                    f"{self}: expected server close (armed by "
+                    f"{self._expect_server_close_reason}), reconnecting"
+                )
+                self._expect_server_close = False
+                self._expect_server_close_reason = None
+                await self._disconnect_websocket()
+                await self._connect_websocket_locked()
+                return True
         return await super()._maybe_try_reconnect(error_message, report_error, error)
+
+    async def _reconnect_websocket(self, attempt_number: int) -> bool:
+        """Serialize base error recovery with an on-demand connection attempt."""
+        async with self._connect_lock:
+            if self._disconnecting:
+                return False
+            if (
+                self._receiving_socket is None
+                or self._receiving_socket is self._websocket
+            ):
+                await self._disconnect_websocket()
+            await self._connect_websocket_locked()
+            if not await self._verify_connection():
+                raise ConnectionError(
+                    f"{self} websocket reconnection failed verification"
+                )
+            return True
 
     async def on_turn_context_created(self, context_id: str):
         """Rebuild a spent session as the next turn begins, once one has died.
@@ -674,6 +701,7 @@ class SlngTTSService(WebsocketTTSService):
         reconnect, which is what makes that capture current.
         """
         ws = self._get_websocket()
+        self._receiving_socket = ws
         async for message in ws:
             if isinstance(message, bytes):
                 await self._handle_audio_bytes(message, ws)
@@ -767,6 +795,8 @@ class SlngTTSService(WebsocketTTSService):
             logger.error(f"{self}: SLNG TTS error: {error_msg}")
             await self.push_error(error_msg=str(error_msg))
             await self.stop_all_metrics()
+            # ponytail: ready-then-error infers a spent session; a typed provider
+            # error contract would avoid rebuilding on unrelated server errors.
             if self._ready_event.is_set() and not self._disconnecting:
                 self._session_dies_per_utterance = True
                 # Preserve main's retry-before-audio behavior only when ownership
