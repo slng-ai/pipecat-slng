@@ -5,6 +5,8 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-09
+
 ### Added
 
 - Optional `SlngTTSService(warm_standby_enabled=True)`, disabled by default.
