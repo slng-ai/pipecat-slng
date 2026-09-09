@@ -1149,7 +1149,7 @@ async def _replay(script, texts):
         if kind == "wire":
             service.seconds = at
             name, nbytes = payload if isinstance(payload, tuple) else (payload, 0)
-            log.mark(1, name, nbytes)
+            log.mark(1, name, nbytes, b"\x00" * nbytes)
             continue
         if kind == "send":
             service.seconds = at
@@ -1162,6 +1162,10 @@ async def _replay(script, texts):
                     "sent_ok": ok,
                 }
             )
+            continue
+
+        if kind == "complete":
+            observer.completed_at[payload] = at
             continue
 
         frame: Any
@@ -1224,6 +1228,7 @@ def _one_turn(
         script.append((1.05, "audio", ("ctx-a", emitted)))
     if stop:
         script.append((1.1, "stop", "ctx-a"))
+        script.append((1.12, "complete", "ctx-a"))
     return script
 
 
@@ -1259,6 +1264,7 @@ async def test_measurement_qualification():
             (1.0, "wire", "recv:audio_end"),
             (1.05, "audio", ("ctx-a", 400)),
             (1.1, "stop", "ctx-a"),
+            (1.12, "complete", "ctx-a"),
             (2.0, "request", "two"),
             (3.0, "request", "three"),
             (3.1, "send", (2, "ctx-c", True)),
@@ -1267,6 +1273,7 @@ async def test_measurement_qualification():
             (3.7, "wire", "recv:flushed"),
             (3.75, "audio", ("ctx-c", 900)),
             (3.8, "stop", "ctx-c"),
+            (3.82, "complete", "ctx-c"),
         ],
         texts,
     )
@@ -1345,6 +1352,180 @@ async def test_measurement_qualification():
     await socket.close()
     assert "closed" in [name for _, _, name, _ in log.events]
     assert socket.closed_state is State.CLOSED
+
+    # Actual batch acceptance, not merely an error present in a side log.
+    from test_live_smoke import _qualify_batch, _speak_frames
+
+    async def batch(script):
+        rows, observed, wire = await _replay(script, ["one"])
+        return dict(
+            batch="offline",
+            repeat=0,
+            rows=rows,
+            samples=1,
+            stops=len(observed.stops),
+            failures=[],
+            errors=observed.errors,
+            audio_order=observed.audio_order,
+            peak_owned=1,
+            unclosed=0,
+            owned=0,
+            owners=(None, None, None),
+        )
+
+    valid = await batch(_one_turn())
+    _qualify_batch(valid)
+    invalid_scripts = [
+        [
+            (0.7 if kind == "stop" else at, kind, payload)
+            for at, kind, payload in _one_turn()
+        ],
+        _one_turn() + [(1.15, "audio", ("ctx-a", 2))],
+        _one_turn() + [(1.2, "stop", "ctx-a")],
+        _one_turn() + [(1.2, "error", "backend failed")],
+        [event for event in _one_turn() if event[1] != "complete"],
+        _one_turn(sent_ok=False),
+        _one_turn(text_send=False),
+        _one_turn(audio=False),
+        _one_turn(terminal=None),
+        _one_turn(stop=False),
+    ]
+    for script in invalid_scripts:
+        with pytest.raises(AssertionError):
+            _qualify_batch(await batch(script))
+    for mutation in (
+        {"audio_order": ["ctx-a", "ctx-b", "ctx-a"]},
+        {"audio_order": ["wrong"]},
+        {"unclosed": 1},
+        {"owned": 1},
+        {"owners": (object(), None, None)},
+        {"peak_owned": 2},
+        {"failures": ["deadline"]},
+    ):
+        with pytest.raises(AssertionError):
+            _qualify_batch(valid | mutation)
+
+    # Equal byte totals cannot hide reordered/corrupt PCM.
+    rows, observed, wire = await _replay(_one_turn(), ["one"])
+    observed.audio_hashes["ctx-a"].update(b"corrupt")
+    from test_live_smoke import _spans
+
+    turns = [dict(index=0, context_id="ctx-a", attempt_at=0.45, sent_ok=True)]
+    assert not _spans(turns, observed, wire, ["one"])[0]["valid"]
+    _, transitions, _ = await _replay(
+        [(0.1, "audio", ("a", 2)), (0.2, "audio", ("b", 2)), (0.3, "audio", ("a", 2))],
+        [],
+    )
+    assert transitions.audio_order == ["a", "b", "a"]
+
+    # Wrong-context and duplicate stops do not advance the next request.
+    observer = type(observer)(_FakeService(), ["one", "two"])
+    turns = [dict(index=0, context_id="a")]
+    failures = []
+    driver = _speak_frames(["one", "two"], 0, observer, failures, turns)
+    assert isinstance(next(driver), TTSSpeakFrame)
+    observer.stopped_at["wrong"] = 1
+    observer.completed_at["wrong"] = 1
+    observer.stops.extend(["wrong", "wrong"])
+    assert isinstance(next(driver), SleepFrame)
+    observer.stopped_at["a"] = 2
+    assert isinstance(next(driver), SleepFrame)
+    observer.completed_at["a"] = 2
+    assert isinstance(next(driver), TTSSpeakFrame)
+    observer.errors.append("failed")
+    assert list(driver) == [] and failures
+
+    # Close failures keep ownership; peer close releases it once on every path.
+    inner = FakeWebSocket()
+    log = _WireLog(_FakeService())
+    socket = _TimedSocket(inner, log, log.reserve())
+    log.sockets.append(socket)
+    real_close = inner.close
+
+    async def failed_close():
+        raise RuntimeError("close failed")
+
+    setattr(inner, "close", failed_close)
+    with pytest.raises(RuntimeError):
+        await socket.close()
+    assert log._owned == 1 and socket.closed_state is State.OPEN
+    await real_close()  # peer closure, without proxy.close
+    assert [message async for message in socket] == []
+    assert log._owned == 0
+    replacement = log.reserve()
+    assert log.peak_owned == 1
+    socket.verify_closed()
+    assert log._owned == 1
+    log.failed_open(replacement)
+    assert log._owned == 0
+
+
+async def test_sarvam_smoke_qualification(monkeypatch):
+    """The real smoke body rejects upstream errors, wrong stops and live sockets."""
+    import test_live_smoke as smoke
+    from conftest import FakeWebSocket
+    from pipecat.frames.frames import TranscriptionFrame
+
+    monkeypatch.setenv("SLNG_API_KEY", "offline-placeholder")
+    for defect in (
+        None,
+        "tts_error",
+        "stt_error",
+        "wrong_stop",
+        "early_stop",
+        "open",
+        "no_socket",
+    ):
+        captured = []
+
+        async def connect(*args, **kwargs):
+            ws = FakeWebSocket()
+            captured.append(ws)
+            return ws
+
+        monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+        monkeypatch.setattr("pipecat_slng.stt.websocket_connect", connect)
+
+        async def run(service, **kwargs):
+            assert kwargs["start_timeout"] == smoke._START_TIMEOUT
+            is_tts = isinstance(service, SlngTTSService)
+            module = smoke.pipecat_slng.tts if is_tts else smoke.pipecat_slng.stt
+            if defect != "no_socket":
+                ws = await module.websocket_connect("offline")
+                if defect != "open":
+                    await ws.close()
+            if is_tts:
+                audio = TTSAudioRawFrame(
+                    audio=b"\x01\x02",
+                    sample_rate=16000,
+                    num_channels=1,
+                    context_id="ctx",
+                )
+                stop = TTSStoppedFrame(
+                    context_id="wrong" if defect == "wrong_stop" else "ctx"
+                )
+                down = [stop, audio] if defect == "early_stop" else [audio, stop]
+            else:
+                down = [
+                    TranscriptionFrame(
+                        text=smoke._SARVAM_SENTENCE, user_id="", timestamp=""
+                    )
+                ]
+            upstream = (
+                [ErrorFrame(error="service failed")]
+                if defect == ("tts_error" if is_tts else "stt_error")
+                else []
+            )
+            return down, upstream
+
+        monkeypatch.setattr(smoke, "run_test", run)
+        if defect is None:
+            await smoke.test_live_sarvam_speech()
+        else:
+            with pytest.raises(AssertionError):
+                await smoke.test_live_sarvam_speech()
+        for ws in captured:
+            await ws.close()
 
 
 async def _wait_for_connections(fakes, count, timeout=2.0):

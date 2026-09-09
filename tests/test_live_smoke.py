@@ -10,6 +10,7 @@ Skipped unless SLNG_API_KEY is set. These hit the real bridge, so they are
 excluded from offline/CI-without-secrets runs.
 """
 
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -33,6 +34,7 @@ from pipecat.transcriptions.language import Language
 from websockets.protocol import State
 
 import pipecat_slng
+import pipecat_slng.stt
 import pipecat_slng.tts
 from pipecat_slng import SlngHttpTTSService, SlngSTTService, SlngTTSService
 
@@ -352,20 +354,33 @@ class _WireLog:
         self.sockets: list = []
         self._owned = 0
         self.peak_owned = 0
+        self._next_socket = 0
+        self._audio_hash = hashlib.sha256()
+        self.audio_hashes: list[tuple[float, str]] = []
 
     def now(self) -> float:
         """Seconds on the pipeline clock."""
         return self._tts.get_clock().get_time() / 1e9
 
-    def mark(self, socket_no: int, label: str, nbytes: int = 0) -> float:
+    def mark(
+        self, socket_no: int, label: str, nbytes: int = 0, audio: bytes = b""
+    ) -> float:
         """Append one timestamped event and return its timestamp."""
         at = self.now()
         self.events.append((at, socket_no, label, nbytes))
+        if label == "send:text":
+            self._audio_hash = hashlib.sha256()
+        elif label == "audio":
+            self._audio_hash.update(audio)
+            self.audio_hashes.append((at, self._audio_hash.hexdigest()))
         return at
 
     def reserve(self) -> int:
         """Own a socket from before the connect attempt, and number it."""
-        socket_no = len(self.sockets) + 1
+        for socket in self.sockets:
+            socket.verify_closed()
+        self._next_socket += 1
+        socket_no = self._next_socket
         self._owned += 1
         self.peak_owned = max(self.peak_owned, self._owned)
         self.mark(socket_no, "connect_start")
@@ -457,7 +472,14 @@ class _TimedSocket:
     @property
     def closed_state(self):
         """The real connection's state, for post-teardown assertions."""
+        self.verify_closed()
         return self._inner.state
+
+    def verify_closed(self):
+        """Release exactly once, only after observing real transport closure."""
+        if not self._closed and self._inner.state is State.CLOSED:
+            self._closed = True
+            self._log.closed(self._no)
 
     async def send(self, data):
         """Timestamp the outbound message kind, then send it."""
@@ -475,9 +497,7 @@ class _TimedSocket:
             await self._inner.close(*args, **kwargs)
         finally:
             self._log.mark(self._no, "close_done")
-            if not self._closed:
-                self._closed = True
-                self._log.closed(self._no)
+            self.verify_closed()
 
     async def __aiter__(self):
         """Yield received frames, timestamping each one by kind and size."""
@@ -487,10 +507,12 @@ class _TimedSocket:
                     self._no,
                     _wire_kind(message),
                     len(message) if isinstance(message, bytes) else 0,
+                    message if isinstance(message, bytes) else b"",
                 )
                 yield message
         finally:
             self._log.mark(self._no, "recv_end")
+            self.verify_closed()
 
 
 def _install_wire_log(mp, tts) -> _WireLog:
@@ -501,7 +523,7 @@ def _install_wire_log(mp, tts) -> _WireLog:
         socket_no = log.reserve()
         try:
             inner = await _REAL_WS_CONNECT(url, **kwargs)
-        except Exception:
+        except BaseException:
             log.failed_open(socket_no)
             raise
         socket = _TimedSocket(inner, log, socket_no)
@@ -513,7 +535,7 @@ def _install_wire_log(mp, tts) -> _WireLog:
     return log
 
 
-def _install_turn_log(tts, log: _WireLog, texts) -> list[dict]:
+def _install_turn_log(tts, log: _WireLog, texts, observer) -> list[dict]:
     """Record each turn's context ID, send attempt and send outcome together.
 
     ``run_tts`` is the one place where a turn's text and its synthesis context
@@ -545,6 +567,13 @@ def _install_turn_log(tts, log: _WireLog, texts) -> list[dict]:
             raise
 
     tts.run_tts = _run_tts
+    real_completed = tts.on_audio_context_completed
+
+    async def _completed(context_id):
+        await real_completed(context_id)
+        observer.completed_at[context_id] = log.now()
+
+    tts.on_audio_context_completed = _completed
     return turns
 
 
@@ -568,6 +597,9 @@ class _TurnObserver(BaseObserver):
         self.requested_at: dict[int, float] = {}
         self.audio_order: list[str] = []
         self.audio_bytes: dict[str, int] = {}
+        self.audio_hashes: dict = {}
+        self.audio_times: dict[str, list[float]] = {}
+        self.completed_at: dict[str, float] = {}
         self.stopped_at: dict[str, float] = {}
         self.stops: list[str] = []
         self.errors: list[str] = []
@@ -586,8 +618,10 @@ class _TurnObserver(BaseObserver):
             return
         if isinstance(frame, TTSAudioRawFrame) and frame.audio:
             ctx = frame.context_id or ""
-            if ctx not in self.audio_bytes:
+            if not self.audio_order or self.audio_order[-1] != ctx:
                 self.audio_order.append(ctx)
+            self.audio_times.setdefault(ctx, []).append(at)
+            self.audio_hashes.setdefault(ctx, hashlib.sha256()).update(frame.audio)
             self.audio_bytes[ctx] = self.audio_bytes.get(ctx, 0) + len(frame.audio)
         elif isinstance(frame, TTSStoppedFrame):
             ctx = frame.context_id or ""
@@ -597,7 +631,9 @@ class _TurnObserver(BaseObserver):
             self.errors.append(frame.error)
 
 
-def _speak_frames(texts, gap: float, observer: _TurnObserver, failures: list[str]):
+def _speak_frames(
+    texts, gap: float, observer: _TurnObserver, failures: list[str], turns
+):
     """Yield one speak frame per text, waiting for each to complete first.
 
     ponytail: polls with short sleep frames because ``run_test``'s frame pump
@@ -612,16 +648,23 @@ def _speak_frames(texts, gap: float, observer: _TurnObserver, failures: list[str
     for turn, text in enumerate(texts):
         yield TTSSpeakFrame(text=text)
         waited = 0.0
-        while len(observer.stops) <= turn and waited < _UTTERANCE_DEADLINE:
+        while waited < _UTTERANCE_DEADLINE:
+            matches = [t for t in turns if t["index"] == turn]
+            ctx = matches[0]["context_id"] if len(matches) == 1 else None
+            if observer.errors:
+                failures.append(f"turn {turn}: service error; batch abandoned")
+                return
+            if ctx and ctx in observer.stopped_at and ctx in observer.completed_at:
+                break
             yield SleepFrame(sleep=_POLL_INTERVAL)
             waited += _POLL_INTERVAL
-        if len(observer.stops) <= turn:
+        else:
             failures.append(
-                f"turn {turn} produced no downstream completion within "
+                f"turn {turn} produced no matching downstream/context completion within "
                 f"{_UTTERANCE_DEADLINE}s; batch abandoned"
             )
             return
-        if gap:
+        if gap and turn < len(texts) - 1:
             yield SleepFrame(sleep=gap)
 
 
@@ -730,11 +773,36 @@ def _spans(turns, observer: _TurnObserver, log: _WireLog, texts) -> list[dict]:
             row["invalid_reason"] = "no terminal message"
         elif stop_at is None:
             row["invalid_reason"] = "no downstream completion"
+        elif not (
+            request_at <= attempt_at <= text_at <= audio_at <= terminal_at <= stop_at
+            and audio_at
+            <= min(observer.audio_times.get(turn["context_id"], [float("inf")]))
+            and max(observer.audio_times.get(turn["context_id"], [float("inf")]))
+            <= stop_at
+            and (log.last("audio", window_end) or audio_at) <= terminal_at
+        ):
+            row["invalid_reason"] = "invalid event ordering"
+        elif stop_at > observer.completed_at.get(turn["context_id"], float("-inf")):
+            row["invalid_reason"] = "no matching context completion"
+        elif observer.stops.count(turn["context_id"]) != 1:
+            row["invalid_reason"] = "duplicate completion"
         elif row["received_bytes"] != row["emitted_bytes"]:
             row["invalid_reason"] = (
                 f"received {row['received_bytes']} bytes but emitted "
                 f"{row['emitted_bytes']} for this context"
             )
+        elif (
+            next(
+                (
+                    digest
+                    for at, digest in reversed(log.audio_hashes)
+                    if text_at <= at < window_end
+                ),
+                None,
+            )
+            != observer.audio_hashes[turn["context_id"]].hexdigest()
+        ):
+            row["invalid_reason"] = "audio content/order mismatch"
         else:
             row["valid"] = True
     return rows
@@ -782,10 +850,10 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
     # wrapper and count every socket twice.
     with pytest.MonkeyPatch.context() as mp:
         log = _install_wire_log(mp, tts)
-        turns = _install_turn_log(tts, log, texts)
+        turns = _install_turn_log(tts, log, texts, observer)
         await run_test(
             tts,
-            frames_to_send=_speak_frames(texts, gap, observer, failures),
+            frames_to_send=_speak_frames(texts, gap, observer, failures, turns),
             observers=[observer],
             start_timeout=_START_TIMEOUT,
         )
@@ -813,6 +881,7 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
         "sockets": len(log.sockets),
         "peak_owned": log.peak_owned,
         "unclosed": len(unclosed),
+        "owned": log._owned,
         "stops": len(observer.stops),
         "errors": list(observer.errors),
         "failures": failures,
@@ -843,6 +912,42 @@ def _report_group(label: str, rows) -> None:
         )
 
 
+def _qualify_batch(result):
+    """Reject unusable observations after the pipeline has cleaned up."""
+    label = f"{result['batch']} r{result['repeat']}"
+    assert not result["failures"], f"{label}: {result['failures']}"
+    assert not result["errors"], f"{label}: service errors {result['errors']}"
+    invalid = [
+        f"#{r['index']}: {r['invalid_reason']}"
+        for r in result["rows"]
+        if not r["valid"]
+    ]
+    assert not invalid, f"{label}: unusable samples {invalid}"
+    assert result["stops"] == result["samples"], (
+        f"{label}: {result['stops']} completions for {result['samples']} requests"
+    )
+    # Audio for one context must finish before the next context's begins;
+    # a context reappearing later means interleaved or stale playback.
+    seen: list[str] = []
+    for context_id in result["audio_order"]:
+        if not seen or seen[-1] != context_id:
+            assert context_id not in seen, f"{label}: audio for {context_id} resumed"
+            seen.append(context_id)
+    assert seen == [row["context_id"] for row in result["rows"]], (
+        f"{label}: audio contexts are out of request order"
+    )
+    assert result["peak_owned"] <= 1, (
+        f"{label}: baseline owned {result['peak_owned']} simultaneous sockets"
+    )
+    assert result["owned"] == 0, f"{label}: socket reservations remain owned"
+    assert result["unclosed"] == 0, (
+        f"{label}: {result['unclosed']} sockets still open after teardown"
+    )
+    assert result["owners"] == (None, None, None), (
+        f"{label}: resources still owned after teardown: {result['owners']}"
+    )
+
+
 @measurement
 async def test_live_tts_warm_standby_measurement():
     """Measure the existing preparation baseline on an explicitly named route.
@@ -866,6 +971,11 @@ async def test_live_tts_warm_standby_measurement():
             result = await _measure_batch(name, gap, samples)
             result["repeat"] = repeat
             results.append(result)
+            print(
+                "BATCH_RESULT "
+                + json.dumps({k: v for k, v in result.items() if k != "owners"})
+            )
+            _qualify_batch(result)
 
     language = os.getenv("SLNG_TTS_LANGUAGE") or "service default"
     print(f"\n=== TTS baseline measurement: {os.environ['SLNG_TTS_MODEL']} ===")
@@ -919,38 +1029,6 @@ async def test_live_tts_warm_standby_measurement():
         ]
         print(f"  {name}: " + ", ".join(_fmt(m) for m in medians))
 
-    for result in results:
-        label = f"{result['batch']} r{result['repeat']}"
-        assert not result["failures"], f"{label}: {result['failures']}"
-        assert not result["errors"], f"{label}: service errors {result['errors']}"
-        invalid = [
-            f"#{r['index']}: {r['invalid_reason']}"
-            for r in result["rows"]
-            if not r["valid"]
-        ]
-        assert not invalid, f"{label}: unusable samples {invalid}"
-        assert result["stops"] == result["samples"], (
-            f"{label}: {result['stops']} completions for {result['samples']} requests"
-        )
-        # Audio for one context must finish before the next context's begins;
-        # a context reappearing later means interleaved or stale playback.
-        seen: list[str] = []
-        for context_id in result["audio_order"]:
-            if not seen or seen[-1] != context_id:
-                assert context_id not in seen, (
-                    f"{label}: audio for {context_id} resumed"
-                )
-                seen.append(context_id)
-        assert result["peak_owned"] <= 1, (
-            f"{label}: baseline owned {result['peak_owned']} simultaneous sockets"
-        )
-        assert result["unclosed"] == 0, (
-            f"{label}: {result['unclosed']} sockets still open after teardown"
-        )
-        assert result["owners"] == (None, None, None), (
-            f"{label}: resources still owned after teardown: {result['owners']}"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Sarvam TTS + STT compatibility smoke (spec 002-fix-tts-completion, US2)
@@ -999,16 +1077,32 @@ async def test_live_sarvam_speech():
         sample_rate=_SARVAM_RATE,
     )
 
-    down, _ = await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text=_SARVAM_SENTENCE), SleepFrame(sleep=8.0)],
+    sockets = {"tts": [], "stt": []}
+
+    async def run_leg(service, frames, kind):
+        module = pipecat_slng.tts if kind == "tts" else pipecat_slng.stt
+        connect = module.websocket_connect
+
+        async def capture(*args, **kwargs):
+            ws = await connect(*args, **kwargs)
+            sockets[kind].append(ws)
+            return ws
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(module, "websocket_connect", capture)
+            return await run_test(
+                service, frames_to_send=frames, start_timeout=_START_TIMEOUT
+            )
+
+    down, up = await run_leg(
+        tts, [TTSSpeakFrame(text=_SARVAM_SENTENCE), SleepFrame(sleep=8.0)], "tts"
     )
 
     speech = b"".join(
         f.audio for f in down if isinstance(f, TTSAudioRawFrame) and f.audio
     )
     stops = [f for f in down if isinstance(f, TTSStoppedFrame)]
-    tts_errors = [f.error for f in down if isinstance(f, ErrorFrame)]
+    tts_errors = [f.error for f in [*down, *up] if isinstance(f, ErrorFrame)]
     tts_owners = (tts._websocket, tts._receive_task, tts._keepalive_task)
 
     transcript = None
@@ -1036,14 +1130,16 @@ async def test_live_sarvam_speech():
             frames.append(SleepFrame(sleep=0.05))
         frames += [VADUserStoppedSpeakingFrame(), SleepFrame(sleep=8.0)]
 
-        stt_down, _ = await run_test(stt, frames_to_send=frames)
+        stt_down, stt_up = await run_leg(stt, frames, "stt")
         finals = [
             f.text
             for f in stt_down
             if isinstance(f, TranscriptionFrame) and f.text.strip()
         ]
         transcript = finals[-1] if finals else None
-        stt_errors = [f.error for f in stt_down if isinstance(f, ErrorFrame)]
+        stt_errors = [
+            f.error for f in [*stt_down, *stt_up] if isinstance(f, ErrorFrame)
+        ]
         stt_owners = (stt._websocket, stt._receive_task)
 
     print(
@@ -1065,7 +1161,16 @@ async def test_live_sarvam_speech():
         f"expected exactly one TTS completion, saw {len(stops)} "
         "(zero is the pre-fix defect this feature corrects)"
     )
-    assert stops[0].context_id, "completion carries no synthesis context"
+    audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame) and f.audio]
+    assert stops[0].context_id and {f.context_id for f in audio_frames} == {
+        stops[0].context_id
+    }, "audio/completion context mismatch"
+    assert all(down.index(f) < down.index(stops[0]) for f in audio_frames), (
+        "audio after completion"
+    )
+    assert all(
+        f.sample_rate == _SARVAM_RATE and f.num_channels == 1 for f in audio_frames
+    ), "unexpected speech format"
     assert not stt_errors, f"Sarvam STT service errors: {stt_errors}"
     assert transcript, "Sarvam STT returned no final transcript for real speech"
     assert _normalise(transcript) == _SARVAM_EXPECTED, (
@@ -1073,3 +1178,9 @@ async def test_live_sarvam_speech():
     )
     assert tts_owners == (None, None, None), f"TTS resources still owned: {tts_owners}"
     assert stt_owners == (None, None), f"STT resources still owned: {stt_owners}"
+
+    for kind, captured in sockets.items():
+        assert captured and all(ws.state is State.CLOSED for ws in captured), (
+            f"{kind}: sockets not closed"
+        )
+        print(f"  {kind}: {len(captured)} sockets verified CLOSED")
