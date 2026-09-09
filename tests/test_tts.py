@@ -2448,3 +2448,96 @@ async def test_failed_on_demand_replacement_keeps_later_speech_receivable(monkey
         if isinstance(f, ErrorFrame)
     )
     assert all(ws.state is State.CLOSED for ws in sockets)
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_replacement_waits_for_closing_transport(monkeypatch, shutdown):
+    """A closing transport remains owned until CLOSED, before the next connect."""
+    from conftest import FakeWebSocket
+
+    tts = _make_tts()
+    old, replacement = FakeWebSocket(), FakeWebSocket()
+    old.state = State.CLOSING
+    tts._websocket = old
+    release = asyncio.Event()
+    opened = []
+    real_close = old.close
+
+    async def finish_close():
+        await release.wait()
+        await real_close()
+
+    async def connect(*args, **kwargs):
+        opened.append(old.state)
+        return replacement
+
+    monkeypatch.setattr(old, "close", finish_close)
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    task = asyncio.create_task(tts._connect_websocket())
+    try:
+        await asyncio.sleep(0)
+        assert not opened, "replacement started while the old socket was closing"
+        tts._disconnecting = shutdown
+        release.set()
+        await task
+        assert opened == ([] if shutdown else [State.CLOSED])
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await real_close()
+        await replacement.close()
+
+
+async def test_old_unfinished_context_cannot_retire_replacement(monkeypatch):
+    """Failed A's context timeout cannot truncate speech on B's new socket."""
+    from conftest import FakeWebSocket
+
+    sockets = []
+    old_dead, finished = asyncio.Event(), asyncio.Event()
+
+    async def connect(*args, **kwargs):
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = _make_tts()
+    chunks = [b"\x11\x22" * 100, b"\x33\x44" * 100, b"\x55\x66" * 100]
+
+    def frames():
+        yield TTSSpeakFrame(text="A loses its connection")
+        while not old_dead.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="B still speaks")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.2)
+
+    async def server():
+        await _await_sockets(sockets, 1)
+        await _await_sent(sockets[0], "flush")
+        sockets[0].state = State.CLOSED
+        old_dead.set()
+        await _await_sockets(sockets, 2)
+        await sockets[0].close()
+        await _await_sent(sockets[1], "flush")
+        await sockets[1].feed(chunks[0])
+        await asyncio.sleep(1.6)
+        await sockets[1].feed(chunks[1])
+        await asyncio.sleep(1.6)  # A would time out; B still has fresh audio.
+        await sockets[1].feed(chunks[2])
+        await sockets[1].feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    task = asyncio.create_task(server())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 10)
+        await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert [f.audio for f in _audio(down)] == chunks
+    assert len(_stops(down)) == 1
+    assert {f.context_id for f in _audio(down)} == {_stops(down)[0].context_id}
+    assert len(sockets) == 2 and all(ws.state is State.CLOSED for ws in sockets)
+    assert any(isinstance(f, ErrorFrame) for f in [*down, *up])  # A fails visibly.

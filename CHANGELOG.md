@@ -21,6 +21,9 @@ to [Semantic Versioning](https://semver.org/).
   its replacement. Failed ownership and old-socket control messages cannot affect
   the next stream; stale explicit flushes cannot terminate another turn. Teardown
   closes retiring connections as well as the current one.
+- A closing transport finishes closing before a replacement opens. Unfinished
+  contexts from that transport fail visibly and cannot later retire or truncate
+  speech on the replacement.
 - Reject `reuse_context_id_within_turn=False` before connecting because the bridge's
   anonymous stream cannot attribute audio to separate fragment contexts.
 

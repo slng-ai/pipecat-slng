@@ -359,7 +359,20 @@ class SlngTTSService(WebsocketTTSService):
         )
         await self.remove_audio_context(turn.context_id)
 
-    async def _retire_stream(self, reason: str, replay: _WireTurn | None = None):
+    async def _abandon_wire_turns(self, ws, reason, replay=None):
+        """Detach failed stream ownership before any context callbacks can run."""
+        abandoned = [turn for turn in self._wire if turn.socket is ws]
+        self._wire = [turn for turn in self._wire if turn.socket is not ws]
+        for turn in abandoned:
+            if turn is not replay:
+                await self.push_error(
+                    error_msg=f"SLNG TTS context {turn.context_id} abandoned: {reason}"
+                )
+                await self.remove_audio_context(turn.context_id)
+
+    async def _retire_stream(
+        self, reason: str, replay: _WireTurn | None = None, *, expected_socket=None
+    ):
         """Invalidate anonymous output before replacing a failed/abandoned stream.
 
         Only a single unvoiced turn may be retried after a server error. An
@@ -369,22 +382,20 @@ class SlngTTSService(WebsocketTTSService):
         """
         async with self._connect_lock:
             old = self._websocket
-            if old is None or self._disconnecting:
+            if (
+                old is None
+                or self._disconnecting
+                or (expected_socket is not None and old is not expected_socket)
+            ):
                 return
             logger.debug(f"{self}: retiring TTS stream ({reason})")
-            abandoned = [t for t in self._wire if t is not replay]
-            self._wire.clear()
             self._pending_resend = replay
             self._retiring = old
             self._websocket = None
             self._ready_event.clear()
             self._expect_server_close = False
             self._expect_server_close_reason = None
-            for turn in abandoned:
-                await self.push_error(
-                    error_msg=f"SLNG TTS context {turn.context_id} abandoned: {reason}"
-                )
-                await self.remove_audio_context(turn.context_id)
+            await self._abandon_wire_turns(old, reason, replay)
             await self._close_retiring_socket()
             if not self._disconnecting:
                 await self._connect_websocket_locked()
@@ -418,6 +429,15 @@ class SlngTTSService(WebsocketTTSService):
             return
         try:
             if self._websocket and self._websocket.state is State.OPEN:
+                return
+
+            if self._websocket is not None:
+                await self._abandon_wire_turns(
+                    self._websocket, "connection closed before completion"
+                )
+                if self._websocket.state is not State.CLOSED:
+                    await self._websocket.close()
+            if self._disconnecting:
                 return
 
             model = self._settings.model
@@ -596,7 +616,9 @@ class SlngTTSService(WebsocketTTSService):
                 f"{self}: session spent (armed by {armed_by}), "
                 f"rebuilding for the next turn"
             )
-            await self._retire_stream("spent session at turn start")
+            await self._retire_stream(
+                "spent session at turn start", expected_socket=self._websocket
+            )
         await super().on_turn_context_created(context_id)
 
     async def on_audio_context_interrupted(self, context_id: str):
@@ -637,8 +659,11 @@ class SlngTTSService(WebsocketTTSService):
         """
         if self._pending_resend and self._pending_resend.context_id == context_id:
             self._pending_resend = None
-        if any(t.context_id == context_id for t in self._wire):
-            await self._retire_stream(f"no terminal for context {context_id}")
+        turn = next((t for t in self._wire if t.context_id == context_id), None)
+        if turn is not None:
+            await self._retire_stream(
+                f"no terminal for context {context_id}", expected_socket=turn.socket
+            )
         await super().on_audio_context_completed(context_id)
 
     async def flush_audio(self, context_id: str | None = None):
@@ -810,7 +835,11 @@ class SlngTTSService(WebsocketTTSService):
                     and not turn.retried
                     else None
                 )
-                await self._retire_stream("server error", replay)
+                await self._retire_stream(
+                    "server error",
+                    replay,
+                    expected_socket=ws if ws is not None else self._websocket,
+                )
 
         else:
             logger.debug(f"{self}: unknown message: {data}")
