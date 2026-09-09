@@ -5,6 +5,17 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Optional `SlngTTSService(warm_standby_enabled=True)`, disabled by default.
+  Prepares one acknowledged spare after the first text send and selects it at
+  the next utterance boundary, preserving audio ownership and limiting all
+  opening/open/closing transports to two. Settings changes and teardown release
+  preparation; keepalive uses the existing interval. Enabling consumes an extra
+  gateway/provider session and changes connection reuse to rotation when ready.
+  Verified with Pipecat 1.8.0. Controlled Gradium reconnect measurements showed
+  lower first-audio latency; no general improvement is claimed for healthy reuse.
+
 ### Fixed
 
 - Streaming TTS attributes audio and `audio_end`/`flushed` completion to submitted
@@ -38,8 +49,11 @@ to [Semantic Versioning](https://semver.org/).
 
 - Add completion, pipelined-turn, recovery, and interruption regression coverage,
   plus opt-in Sarvam TTS/STT speech checks and repeated latency measurements.
-  Verified against Pipecat 1.8.0. No latency improvement or warm standby benefit
-  is claimed. No gateway, STT runtime, or HTTP TTS changes.
+  Verified against Pipecat 1.8.0. Completion/recovery fixes alone claim no latency
+  improvement. No gateway, STT runtime, or HTTP TTS changes.
+- Extend the gated measurement scenario with interleaved baseline/standby runs,
+  actual handoff diagnostics, socket-specific timing/audio qualification, and a
+  separately labelled forced-reconnect condition.
 
 ## [0.5.1] - 2026-08-27
 

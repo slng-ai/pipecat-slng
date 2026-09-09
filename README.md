@@ -88,6 +88,54 @@ Three behaviors worth knowing:
   mid-session (via Pipecat settings updates) reconnects the WebSocket to
   re-run the init handshake — expect a brief reconnect, not a silent no-op.
 
+### Optional TTS warm standby
+
+Enable one prepared connection for the next utterance:
+
+```python
+tts = SlngTTSService(
+    api_key=os.environ["SLNG_API_KEY"],
+    model="gradium/tts:default",
+    voice="QETTJoT4n_WmpL3w",
+    warm_standby_enabled=True,  # default: False
+)
+```
+
+Preparation starts after the first successful text send. The next utterance
+uses the spare only after that connection acknowledges `ready`; a pending,
+expired, or failed spare falls back to ordinary connection handling. Startup
+still uses the initial connection. All fragments of an utterance stay together;
+Pipecat's default `reuse_context_id_within_turn=True` is required.
+
+When enabled, the service rotates to a ready spare even if the old connection
+remains open. It waits for preceding synthesis to finish, preserves queued
+playback, and closes the old transport in the background. At most two
+connections are opening, open, or closing. Settings changes invalidate prepared
+connections; interruption retires unfinished synthesis; shutdown closes both.
+Preparation uses an extra gateway/provider session, which can consume connection
+quota or incur provider charges even when unused.
+
+Both initialized connections receive the existing 30-second keepalive. This
+cannot prevent every provider expiry, and gateway `ready` does not guarantee
+that all provider preparation has finished. An expired spare is retried after
+later speech, without synthetic warmup text or a continuous reconnect loop.
+Debug logs report actual use, miss reason, and background preparation time by
+synthesis context, without logging speech or credentials in those records.
+
+In September 2026 tests with Pipecat 1.8.0, Gradium's controlled per-utterance
+reconnection case improved median request-to-first-audio from **1,079–1,415 ms**
+across baseline batches to **77–109 ms** with standby. Each condition used five
+utterances, interleaving baseline/standby/baseline twice with 1.5-second gaps;
+these medians exclude startup. Reconnection was forced by the test to isolate
+its cost. Normal Gradium, Deepgram, and Sarvam reuse showed no consistent improvement.
+These client measurements do not identify deployed gateway revision or provider
+cache state; measure your route before enabling the option.
+
+The opt-in measurement test supports `SLNG_TTS_STANDBY_COMPARE=1`, alongside
+`SLNG_API_KEY`, `SLNG_TTS_MEASURE=1`, and explicit `SLNG_TTS_MODEL` and
+`SLNG_TTS_VOICE`. `SLNG_TTS_FORCE_RECONNECT=1` selects the labelled controlled
+condition. These are test inputs, not service configuration.
+
 ### Pronunciation dictionaries
 
 Streaming TTS can use one SLNG pronunciation dictionary as the WebSocket

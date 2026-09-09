@@ -137,6 +137,7 @@ class SlngTTSService(WebsocketTTSService):
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
         pronunciation: dict[str, str] | None = None,
+        warm_standby_enabled: bool = False,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -168,6 +169,10 @@ class SlngTTSService(WebsocketTTSService):
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
             pronunciation: Optional session pronunciation dictionary reference,
                 such as ``{"mode": "rewrite", "name": "support-pronunciations"}``.
+            warm_standby_enabled: Prepare one extra initialized connection for
+                the next utterance. Defaults to False; costs an additional
+                gateway/provider session. Expired or pending spares fall back
+                to normal connection handling.
             settings: Runtime-updatable settings override. Merged on top of any
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
@@ -230,6 +235,295 @@ class SlngTTSService(WebsocketTTSService):
         self._session_dies_per_utterance = False
         self._pending_resend: _WireTurn | None = None
         self._idle_expired = False
+        self._warm_standby_enabled = warm_standby_enabled
+        self._standby_ws = None
+        self._standby_claimed = None
+        self._standby_task = None
+        self._standby_ready = False
+        self._standby_options = None
+        self._standby_prepared_ms = None
+        self._standby_reason = "initial_connection"
+        self._standby_generation = 0
+        self._standby_retiring = None
+        self._standby_close_task = None
+        self._wire_drained = asyncio.Event()
+        self._wire_drained.set()
+
+    def _connection_options(self):
+        """Freeze routing and init before either connection starts I/O."""
+        model = self._settings.model
+        if not is_given(model) or not model:
+            model = _DEFAULT_TTS_MODEL
+        model_path = quote(model, safe="/:")
+        base = self._base_url if "://" in self._base_url else f"wss://{self._base_url}"
+        url = f"{base}/v1/bridges/unmute/tts/{model_path}"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        if self._region_override:
+            headers["X-Region-Override"] = self._region_override
+        if self._world_part_override:
+            headers["X-World-Part-Override"] = self._world_part_override
+        if self._provider_key:
+            headers["X-Slng-Provider-Key"] = self._provider_key
+        init = {"type": "init", "config": self._build_config()}
+        if self._settings.voice:
+            init["voice"] = str(self._settings.voice)
+        return url, headers, json.dumps(init)
+
+    async def _open_socket(self, options, *, standby=False):
+        url, headers, init = options
+        ws = await websocket_connect(url, additional_headers=headers)
+        owner = "_standby_ws" if standby else "_websocket"
+        setattr(self, owner, ws)
+        try:
+            await ws.send(init)
+        except BaseException:
+            try:
+                await ws.close()
+            finally:
+                if ws.state is State.CLOSED and getattr(self, owner) is ws:
+                    setattr(self, owner, None)
+            raise
+        return ws
+
+    def _update_wire_drained(self):
+        if not self._wire and self._pending_resend is None:
+            self._wire_drained.set()
+        else:
+            self._wire_drained.clear()
+
+    def _start_standby(self):
+        """One attempt after a turn's first send; failure waits for later work."""
+        if (
+            not self._warm_standby_enabled
+            or self._disconnecting
+            or self._standby_ws is not None
+            or self._standby_claimed is not None
+            or (self._standby_task is not None and not self._standby_task.done())
+        ):
+            return
+        self._standby_reason = "pending"
+        self._standby_task = self.create_task(
+            self._prepare_standby(self._standby_generation)
+        )
+
+    async def _prepare_standby(self, generation):
+        ws = None
+        try:
+            # Retirement still occupies the optional slot, even though the next
+            # utterance can already speak on its promoted connection.
+            await self._await_standby_retirement()
+            if self._disconnecting or generation != self._standby_generation:
+                return
+            options = self._connection_options()
+            started = asyncio.get_running_loop().time()
+            ws = await self._open_socket(options, standby=True)
+            self._standby_ws = ws
+            self._standby_options = options
+            self._standby_ready = False
+            if self._disconnecting or generation != self._standby_generation:
+                return
+            self._standby_reason = "not_ready"
+            messages = aiter(ws)
+            async with asyncio.timeout(self._ready_timeout):
+                while not self._standby_ready:
+                    message = await anext(messages)
+                    self._check_standby_message(message)
+            self._standby_prepared_ms = (
+                asyncio.get_running_loop().time() - started
+            ) * 1000
+            # Keep a reader on the unused socket: OPEN alone cannot tell us that
+            # a provider error or unexpected audio invalidated the preparation.
+            async for message in messages:
+                self._check_standby_message(message)
+            self._standby_reason = "closed"
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, StopAsyncIteration):
+            self._standby_reason = "not_ready" if not self._standby_ready else "closed"
+        except Exception:
+            self._standby_reason = "failed"
+            logger.warning(f"{self}: warm standby preparation failed")
+        finally:
+            ws = ws if ws is not None else self._standby_ws
+            if ws is not None and self._standby_ws is ws:
+                self._standby_ready = False
+                try:
+                    await ws.close()
+                finally:
+                    if ws.state is State.CLOSED:
+                        self._standby_ws = None
+
+    def _check_standby_message(self, message):
+        if isinstance(message, bytes):
+            if message:
+                raise ValueError("audio on unused standby")
+            return
+        data = json.loads(message)
+        kind = str(data.get("type", "")).lower()
+        if kind == "ready":
+            self._standby_ready = True
+        elif kind not in ("metadata", "warning"):
+            raise ValueError("unexpected event on unused standby")
+
+    async def _cancel_standby(self):
+        task = self._standby_task
+        if task is not None:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if self._standby_task is task:
+                self._standby_task = None
+        # Retain a reference after a failed close and retry it during teardown.
+        ws = self._standby_ws
+        if ws is not None:
+            await ws.close()
+            if ws.state is State.CLOSED and self._standby_ws is ws:
+                self._standby_ws = None
+        ws = self._standby_claimed
+        if ws is not None:
+            await ws.close()
+            if ws.state is State.CLOSED and self._standby_claimed is ws:
+                self._standby_claimed = None
+        self._standby_ready = False
+
+    async def _close_promoted_predecessor(self, ws):
+        try:
+            await ws.close()
+        except Exception:
+            logger.warning(f"{self}: previous warm-standby transport close failed")
+        finally:
+            if ws.state is State.CLOSED and self._standby_retiring is ws:
+                self._standby_retiring = None
+
+    async def _await_standby_retirement(self):
+        task = self._standby_close_task
+        if task is not None:
+            # Canceling a preparer must not cancel the only closer of the old
+            # active transport. Shutdown joins this task separately.
+            await asyncio.shield(task)
+        if self._standby_retiring is not None:
+            await self._standby_retiring.close()
+            if self._standby_retiring.state is not State.CLOSED:
+                raise ConnectionError("previous TTS transport is not closed")
+            self._standby_retiring = None
+
+    async def _select_standby(self):
+        async with self._connect_lock:
+            ws = self._standby_ws
+            if ws is None or not self._standby_ready:
+                return False, self._standby_reason, None
+            if ws.state is not State.OPEN:
+                return False, "closed", None
+            if self._standby_options != self._connection_options():
+                self._standby_reason = "settings_changed"
+                await self._cancel_standby()
+                return False, "settings_changed", None
+            if self._disconnecting:
+                return False, "unavailable", None
+            prepared_ms = self._standby_prepared_ms
+            watcher, self._standby_task = self._standby_task, None
+            # Claim the socket before cancellation: the watcher's finally block
+            # closes only sockets it still owns.
+            self._standby_ws = None
+            self._standby_ready = False
+            self._standby_claimed = ws
+            try:
+                if watcher is not None:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+                if ws.state is not State.OPEN or self._disconnecting:
+                    await ws.close()
+                    return False, "closed", None
+                receiver, self._receive_task = self._receive_task, None
+                if receiver is not None:
+                    receiver.cancel()
+                    await asyncio.gather(receiver, return_exceptions=True)
+                if ws.state is not State.OPEN or self._disconnecting:
+                    return False, "closed", None
+                # Drain frames already buffered before text gets an owner.
+                # timeout(0) ends at the first blocking receive; it adds no
+                # readiness wait. websockets permits canceling receive safely.
+                try:
+                    async with asyncio.timeout(0):
+                        async for message in ws:
+                            self._check_standby_message(message)
+                except TimeoutError:
+                    pass
+                except Exception:
+                    return False, "failed", None
+                if self._standby_options != self._connection_options():
+                    return False, "settings_changed", None
+                if ws.state is not State.OPEN or self._disconnecting:
+                    return False, "closed", None
+                old = self._websocket
+                self._standby_ready = False
+                self._websocket = ws
+                self._standby_claimed = None
+                self._receiving_socket = None
+                self._ready_event.set()
+                self._idle_expired = False
+                self._expect_server_close = False
+                self._expect_server_close_reason = None
+                if self._retiring is not None and self._retiring.state is State.CLOSED:
+                    self._retiring = None
+                if old is not None and old is not ws and old.state is not State.CLOSED:
+                    self._standby_retiring = old
+                    self._standby_close_task = self.create_task(
+                        self._close_promoted_predecessor(old)
+                    )
+                self._receive_task = self.create_task(
+                    self._receive_task_handler(self._report_error)
+                )
+                await self._call_event_handler("on_disconnected")
+                await self._call_event_handler("on_connected")
+                self._standby_reason = "unavailable"
+                return True, None, prepared_ms
+            finally:
+                if self._standby_claimed is ws:
+                    await ws.close()
+                    if ws.state is State.CLOSED:
+                        self._standby_claimed = None
+
+    async def _prepare_input_turn(self, context_id):
+        used, reason, prepared_ms = False, "disabled", None
+        if self._warm_standby_enabled:
+            while self._wire or self._pending_resend is not None:
+                await self._wire_drained.wait()
+            used, reason, prepared_ms = await self._select_standby()
+            if (
+                not used
+                and self._session_dies_per_utterance
+                and self._expect_server_close
+                and not self._disconnecting
+            ):
+                await self._retire_stream(
+                    "spent session at turn start", expected_socket=self._websocket
+                )
+        logger.bind(
+            slng_warm_standby={
+                "context_id": context_id,
+                "enabled": self._warm_standby_enabled,
+                "used": used,
+                "miss_reason": reason,
+                "prepared_ms": prepared_ms,
+            }
+        ).debug(f"{self}: warm standby selection")
+
+    async def cleanup(self):
+        """Release preparation even when cleanup runs without stop/cancel."""
+        if any(
+            (
+                self._websocket,
+                self._receive_task,
+                self._keepalive_task,
+                self._standby_task,
+                self._standby_ws,
+                self._standby_claimed,
+                self._standby_retiring,
+            )
+        ):
+            await self._disconnect()
+        await super().cleanup()
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -284,6 +578,15 @@ class SlngTTSService(WebsocketTTSService):
 
     async def _disconnect(self):
         await super()._disconnect()
+        self._standby_generation += 1
+        # An optional transport's failed close must not abort active shutdown.
+        closing = await asyncio.gather(
+            self._cancel_standby(),
+            self._await_standby_retirement(),
+            return_exceptions=True,
+        )
+        if self._standby_retiring is None:
+            self._standby_close_task = None
 
         if self._keepalive_task:
             await self.cancel_task(self._keepalive_task)
@@ -298,6 +601,9 @@ class SlngTTSService(WebsocketTTSService):
             await self._close_retiring_socket()
             self._retiring = None
             await self._disconnect_websocket()
+        for error in closing:
+            if isinstance(error, BaseException):
+                raise error
 
     async def _keepalive_task_handler(self):
         """Send a ``keepalive`` control frame while the socket is idle.
@@ -312,12 +618,16 @@ class SlngTTSService(WebsocketTTSService):
         """
         while True:
             await asyncio.sleep(_KEEPALIVE_INTERVAL)
-            if not self._websocket or self._websocket.state is not State.OPEN:
-                continue
-            try:
-                await self._websocket.send(json.dumps({"type": "keepalive"}))
-            except Exception as e:
-                logger.warning(f"{self}: keepalive send failed: {e}")
+            sockets = [self._websocket]
+            if self._standby_ws is not None and self._standby_ready:
+                sockets.append(self._standby_ws)
+            for ws in sockets:
+                if ws is None or ws.state is not State.OPEN:
+                    continue
+                try:
+                    await ws.send(json.dumps({"type": "keepalive"}))
+                except Exception as e:
+                    logger.warning(f"{self}: keepalive send failed: {e}")
 
     #
     # Wire ownership: which synthesis context owns the next output on a socket
@@ -335,6 +645,7 @@ class SlngTTSService(WebsocketTTSService):
         if turn is None or turn.input_finished:
             turn = _WireTurn(context_id=context_id, socket=ws)
             self._wire.append(turn)
+            self._update_wire_drained()
         return turn
 
     def _wire_head(self, ws: Any) -> _WireTurn | None:
@@ -368,6 +679,7 @@ class SlngTTSService(WebsocketTTSService):
         if turn is None or not turn.input_finished:
             return
         self._wire.remove(turn)
+        self._update_wire_drained()
         await self.append_to_audio_context(
             turn.context_id, TTSStoppedFrame(context_id=turn.context_id)
         )
@@ -377,6 +689,7 @@ class SlngTTSService(WebsocketTTSService):
         """Detach failed stream ownership before any context callbacks can run."""
         abandoned = [turn for turn in self._wire if turn.socket is ws]
         self._wire = [turn for turn in self._wire if turn.socket is not ws]
+        self._update_wire_drained()
         for turn in abandoned:
             if turn is not replay:
                 await self.push_error(
@@ -395,7 +708,12 @@ class SlngTTSService(WebsocketTTSService):
         its reference until closure so cancellation cannot orphan it.
         """
         async with self._connect_lock:
-            await self._retire_stream_locked(reason, replay, expected_socket)
+            defer = self._warm_standby_enabled and replay is None
+            if defer:
+                self._idle_expired = True
+            await self._retire_stream_locked(
+                reason, replay, expected_socket, reconnect=not defer
+            )
 
     async def _retire_stream_locked(
         self, reason, replay, expected_socket, *, reconnect=True
@@ -462,40 +780,20 @@ class SlngTTSService(WebsocketTTSService):
             if self._disconnecting:
                 return
 
-            model = self._settings.model
-            if not is_given(model) or not model:
-                model = _DEFAULT_TTS_MODEL
-            logger.debug(f"Connecting to SLNG TTS ({model})")
-
-            model_path = quote(model, safe="/:")
-            if "://" in self._base_url:
-                ws_url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
-            else:
-                ws_url = f"wss://{self._base_url}/v1/bridges/unmute/tts/{model_path}"
-
-            headers: dict[str, str] = {"Authorization": f"Bearer {self._api_key}"}
-            if self._region_override:
-                headers["X-Region-Override"] = self._region_override
-            if self._world_part_override:
-                headers["X-World-Part-Override"] = self._world_part_override
-            if self._provider_key:
-                headers["X-Slng-Provider-Key"] = self._provider_key
+            await self._await_standby_retirement()
             self._ready_event.clear()
-            self._websocket = await websocket_connect(
-                ws_url, additional_headers=headers
-            )
-
-            init_msg: dict[str, Any] = {"type": "init", "config": self._build_config()}
-            if self._settings.voice:
-                init_msg["voice"] = str(self._settings.voice)
-            await self._websocket.send(json.dumps(init_msg))
+            self._websocket = await self._open_socket(self._connection_options())
             self._idle_expired = False
 
             await self._call_event_handler("on_connected")
         except BaseException as e:
-            ws, self._websocket = self._websocket, None
+            ws = self._websocket
             if ws is not None:
-                await ws.close()
+                try:
+                    await ws.close()
+                finally:
+                    if ws.state is State.CLOSED and self._websocket is ws:
+                        self._websocket = None
             if not isinstance(e, Exception):
                 raise
             # Community-integration guide (V4): push_error AND raise so the
@@ -534,6 +832,7 @@ class SlngTTSService(WebsocketTTSService):
                     ws, "connection closed before completion"
                 )
             self._pending_resend = None
+            self._update_wire_drained()
             await self.stop_all_metrics()
             await self.remove_active_audio_context()
             if self._websocket is ws:
@@ -606,6 +905,17 @@ class SlngTTSService(WebsocketTTSService):
                 return not self._disconnecting and self._websocket is not None
 
             if self._expect_server_close and not self._disconnecting:
+                if (
+                    self._warm_standby_enabled
+                    and not self._wire
+                    and self._pending_resend is None
+                ):
+                    # Let the next input claim the spare. Opening a redundant
+                    # active session here would block that claim on this lock.
+                    self._expect_server_close = False
+                    self._expect_server_close_reason = None
+                    await self._disconnect_websocket()
+                    return False
                 logger.debug(
                     f"{self}: expected server close (armed by "
                     f"{self._expect_server_close_reason}), reconnecting"
@@ -655,7 +965,8 @@ class SlngTTSService(WebsocketTTSService):
             context_id: The newly created turn context ID.
         """
         if (
-            self._session_dies_per_utterance
+            not self._warm_standby_enabled
+            and self._session_dies_per_utterance
             and self._expect_server_close
             and not self._wire
             and self._pending_resend is None
@@ -680,6 +991,7 @@ class SlngTTSService(WebsocketTTSService):
             context_id: The ID of the interrupted audio context.
         """
         self._pending_resend = None
+        self._update_wire_drained()
         await self.stop_all_metrics()
         if self._websocket and self._websocket.state is State.OPEN:
             try:
@@ -711,6 +1023,7 @@ class SlngTTSService(WebsocketTTSService):
         """
         if self._pending_resend and self._pending_resend.context_id == context_id:
             self._pending_resend = None
+            self._update_wire_drained()
         turn = next((t for t in self._wire if t.context_id == context_id), None)
         if turn is not None:
             await self._retire_stream(
@@ -830,6 +1143,7 @@ class SlngTTSService(WebsocketTTSService):
                 turn.socket = self._websocket
                 turn.retried = True
                 self._wire.insert(0, turn)
+                self._update_wire_drained()
                 for text in turn.text:
                     await turn.socket.send(json.dumps({"type": "text", "text": text}))
                 if turn.socket is not self._websocket:
@@ -930,7 +1244,22 @@ class SlngTTSService(WebsocketTTSService):
         logger.debug(f"{self}: Generating TTS [{text}]")
 
         try:
-            if not self._websocket or self._websocket.state is not State.OPEN:
+            first_fragment = self._find_wire_turn(context_id) is None and not (
+                self._pending_resend is not None
+                and self._pending_resend.context_id == context_id
+            )
+            if first_fragment:
+                await self._prepare_input_turn(context_id)
+            if self._disconnecting:
+                return
+            if (
+                not self._websocket
+                or self._websocket.state is not State.OPEN
+                or (
+                    self._warm_standby_enabled
+                    and (self._receive_task is None or self._receive_task.done())
+                )
+            ):
                 await self._connect()
 
             if not self._websocket:
@@ -958,6 +1287,8 @@ class SlngTTSService(WebsocketTTSService):
                     turn.text.append(text)
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
+                if first_fragment:
+                    self._start_standby()
             except Exception as e:
                 # Acceptance is ambiguous — the bridge may have taken the text —
                 # so the stream goes rather than being reused or the text
@@ -995,6 +1326,7 @@ class SlngTTSService(WebsocketTTSService):
         changed = await super()._update_settings(delta)
         if not changed:
             return changed
+        self._standby_reason = "settings_changed"
         await self._disconnect()
         await self._connect()
         return changed

@@ -355,8 +355,9 @@ class _WireLog:
         self._owned = 0
         self.peak_owned = 0
         self._next_socket = 0
-        self._audio_hash = hashlib.sha256()
-        self.audio_hashes: list[tuple[float, str]] = []
+        self._audio_hashes: dict = {}
+        self.audio_hashes: list[tuple[float, int, str]] = []
+        self.selections: dict[str, dict] = {}
 
     def now(self) -> float:
         """Seconds on the pipeline clock."""
@@ -369,10 +370,11 @@ class _WireLog:
         at = self.now()
         self.events.append((at, socket_no, label, nbytes))
         if label == "send:text":
-            self._audio_hash = hashlib.sha256()
+            self._audio_hashes[socket_no] = hashlib.sha256()
         elif label == "audio":
-            self._audio_hash.update(audio)
-            self.audio_hashes.append((at, self._audio_hash.hexdigest()))
+            digest = self._audio_hashes.setdefault(socket_no, hashlib.sha256())
+            digest.update(audio)
+            self.audio_hashes.append((at, socket_no, digest.hexdigest()))
         return at
 
     def reserve(self) -> int:
@@ -409,17 +411,6 @@ class _WireLog:
             None,
         )
 
-    def first_of(self, labels, start: float, end: float = float("inf")):
-        """First ``(timestamp, name)`` from ``labels`` in ``[start, end)``."""
-        return next(
-            (
-                (at, name)
-                for at, _, name, _ in self.events
-                if name in labels and start <= at < end
-            ),
-            (None, None),
-        )
-
     def last(self, label: str, before: float) -> float | None:
         """Timestamp of the last ``label`` strictly before ``before``, else None."""
         return next(
@@ -429,18 +420,6 @@ class _WireLog:
                 if name == label and at < before
             ),
             None,
-        )
-
-    def names(self, start: float, end: float) -> list[str]:
-        """Event names observed in ``[start, end)``, in order."""
-        return [name for at, _, name, _ in self.events if start <= at < end]
-
-    def audio_bytes(self, start: float, end: float) -> int:
-        """Audio bytes received off the wire in ``[start, end)``."""
-        return sum(
-            nbytes
-            for at, _, name, nbytes in self.events
-            if name == "audio" and start <= at < end
         )
 
 
@@ -748,16 +727,52 @@ def _spans(turns, observer: _TurnObserver, log: _WireLog, texts) -> list[dict]:
         if text_at is None:
             row["invalid_reason"] = "no text reached the wire"
             continue
+        # Only sockets carrying this turn's text can supply its audio or setup.
+        # An idle spare's ready/error/audio is never foreground work.
+        sockets = {
+            no
+            for at, no, name, _ in log.events
+            if name == "send:text" and attempt_at <= at < window_end
+        }
+        events = [
+            (at, name, size) for at, no, name, size in log.events if no in sockets
+        ]
+        audio_events = [
+            (at, size)
+            for at, name, size in events
+            if name == "audio" and text_at <= at < window_end
+        ]
         row["request_to_text"] = text_at - request_at
         row["foreground_setup"] = [
-            name for name in log.names(request_at, text_at) if name in _SETUP_EVENTS
+            name
+            for at, name, _ in events
+            if request_at <= at < text_at and name in _SETUP_EVENTS
         ]
-
-        audio_at = log.first("audio", text_at, window_end)
-        terminal_at, terminal = log.first_of(_TERMINAL_EVENTS, text_at, window_end)
+        selection = log.selections.get(turn["context_id"])
+        row["standby"] = selection
+        if selection and selection["used"]:
+            ready = [
+                (at, no)
+                for at, no, name, _ in log.events
+                if no in sockets and name == "recv:ready" and at <= selection["at"]
+            ]
+            if len(sockets) != 1 or not ready or row["foreground_setup"]:
+                row["invalid_reason"] = (
+                    "standby hit lacks prior readiness on speech socket"
+                )
+                continue
+        audio_at = audio_events[0][0] if audio_events else None
+        terminal_at, terminal = next(
+            (
+                (at, name)
+                for at, name, _ in events
+                if name in _TERMINAL_EVENTS and text_at <= at < window_end
+            ),
+            (None, None),
+        )
         stop_at = observer.stopped_at.get(turn["context_id"])
         row["terminal"] = terminal
-        row["received_bytes"] = log.audio_bytes(text_at, window_end)
+        row["received_bytes"] = sum(size for _, size in audio_events)
         row["emitted_bytes"] = observer.audio_bytes.get(turn["context_id"], 0)
         row["stop_at"] = stop_at
 
@@ -779,7 +794,7 @@ def _spans(turns, observer: _TurnObserver, log: _WireLog, texts) -> list[dict]:
             <= min(observer.audio_times.get(turn["context_id"], [float("inf")]))
             and max(observer.audio_times.get(turn["context_id"], [float("inf")]))
             <= stop_at
-            and (log.last("audio", window_end) or audio_at) <= terminal_at
+            and audio_events[-1][0] <= terminal_at
         ):
             row["invalid_reason"] = "invalid event ordering"
         elif stop_at > observer.completed_at.get(turn["context_id"], float("-inf")):
@@ -795,8 +810,8 @@ def _spans(turns, observer: _TurnObserver, log: _WireLog, texts) -> list[dict]:
             next(
                 (
                     digest
-                    for at, digest in reversed(log.audio_hashes)
-                    if text_at <= at < window_end
+                    for at, no, digest in reversed(log.audio_hashes)
+                    if no in sockets and text_at <= at < window_end
                 ),
                 None,
             )
@@ -830,8 +845,15 @@ def _fmt(value) -> str:
     return "n/a" if value is None else f"{value * 1000:.0f}ms"
 
 
-async def _measure_batch(name: str, gap: float, samples: int) -> dict:
-    """Run one baseline batch and return its recorded spans and outcomes."""
+async def _measure_batch(
+    name: str,
+    gap: float,
+    samples: int,
+    *,
+    warm_standby_enabled: bool = False,
+    force_reconnect: bool = False,
+) -> dict:
+    """Measure natural behavior or explicitly forced per-turn reconnection."""
     texts = list(_MEASURE_TEXTS[:samples])
     assert len(set(texts)) == samples, "batch texts must stay distinct"
 
@@ -841,8 +863,11 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
         voice=os.environ["SLNG_TTS_VOICE"],
         sample_rate=24000,
         language=_measure_language(),
+        warm_standby_enabled=warm_standby_enabled,
     )
 
+    # Test-only controlled condition, never presented as natural route behavior.
+    tts._session_dies_per_utterance = force_reconnect
     failures: list[str] = []
     observer = _TurnObserver(tts, texts)
 
@@ -851,12 +876,23 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
     with pytest.MonkeyPatch.context() as mp:
         log = _install_wire_log(mp, tts)
         turns = _install_turn_log(tts, log, texts, observer)
-        await run_test(
-            tts,
-            frames_to_send=_speak_frames(texts, gap, observer, failures, turns),
-            observers=[observer],
-            start_timeout=_START_TIMEOUT,
-        )
+        from loguru import logger
+
+        def selection(message):
+            event = message.record["extra"].get("slng_warm_standby")
+            if event is not None:
+                log.selections[event["context_id"]] = dict(event, at=log.now())
+
+        sink = logger.add(selection, level="DEBUG")
+        try:
+            await run_test(
+                tts,
+                frames_to_send=_speak_frames(texts, gap, observer, failures, turns),
+                observers=[observer],
+                start_timeout=_START_TIMEOUT,
+            )
+        finally:
+            logger.remove(sink)
 
     connect_start = log.first("connect_start", 0.0)
     connect_done = log.first("open", 0.0)
@@ -866,6 +902,8 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
 
     return {
         "batch": name,
+        "warm_standby_enabled": warm_standby_enabled,
+        "forced_reconnect": force_reconnect,
         "gap": gap,
         "samples": samples,
         "rows": _spans(turns, observer, log, texts),
@@ -886,7 +924,16 @@ async def _measure_batch(name: str, gap: float, samples: int) -> dict:
         "errors": list(observer.errors),
         "failures": failures,
         "audio_order": list(observer.audio_order),
-        "owners": (tts._websocket, tts._receive_task, tts._keepalive_task),
+        "owners": (
+            tts._websocket,
+            tts._receive_task,
+            tts._keepalive_task,
+            tts._standby_ws,
+            tts._standby_claimed,
+            tts._standby_task,
+            tts._standby_retiring,
+            tts._standby_close_task,
+        ),
     }
 
 
@@ -923,6 +970,10 @@ def _qualify_batch(result):
         if not r["valid"]
     ]
     assert not invalid, f"{label}: unusable samples {invalid}"
+    if result.get("warm_standby_enabled"):
+        assert all(
+            (row.get("standby") or {}).get("enabled") for row in result["rows"]
+        ), f"{label}: missing actual standby selection"
     assert result["stops"] == result["samples"], (
         f"{label}: {result['stops']} completions for {result['samples']} requests"
     )
@@ -936,14 +987,15 @@ def _qualify_batch(result):
     assert seen == [row["context_id"] for row in result["rows"]], (
         f"{label}: audio contexts are out of request order"
     )
-    assert result["peak_owned"] <= 1, (
-        f"{label}: baseline owned {result['peak_owned']} simultaneous sockets"
+    limit = 2 if result.get("warm_standby_enabled") else 1
+    assert result["peak_owned"] <= limit, (
+        f"{label}: owned {result['peak_owned']} simultaneous sockets (limit {limit})"
     )
     assert result["owned"] == 0, f"{label}: socket reservations remain owned"
     assert result["unclosed"] == 0, (
         f"{label}: {result['unclosed']} sockets still open after teardown"
     )
-    assert result["owners"] == (None, None, None), (
+    assert all(owner is None for owner in result["owners"]), (
         f"{label}: resources still owned after teardown: {result['owners']}"
     )
 
@@ -952,11 +1004,10 @@ def _qualify_batch(result):
 async def test_live_tts_warm_standby_measurement():
     """Measure the existing preparation baseline on an explicitly named route.
 
-    Baseline only: this build has no standby option, so the batches here answer
-    one question — after startup connection, keepalive and eager reconnection,
-    is there still session setup sitting in front of an utterance's text? Each
-    batch is repeated so a later comparison can be judged against baseline
-    variation rather than against a single run.
+    Set SLNG_TTS_STANDBY_COMPARE=1 for interleaved baseline/standby/baseline
+    batches. SLNG_TTS_FORCE_RECONNECT=1 separately models a route that requires
+    a fresh session each turn; those results are labelled as controlled rather
+    than natural provider behavior. Defaults preserve the existing baseline run.
 
     Asserts the outcomes a consumer depends on (every sample accounted for,
     correctly attributed audio, one completion per turn, no service errors and
@@ -966,19 +1017,31 @@ async def test_live_tts_warm_standby_measurement():
     preparation, which this harness cannot see.
     """
     results = []
+    modes = (
+        (False, True, False)
+        if os.getenv("SLNG_TTS_STANDBY_COMPARE") == "1"
+        else (False,)
+    )
     for repeat in range(_MEASURE_REPEATS):
         for name, gap, samples in _MEASURE_BATCHES:
-            result = await _measure_batch(name, gap, samples)
-            result["repeat"] = repeat
-            results.append(result)
-            print(
-                "BATCH_RESULT "
-                + json.dumps({k: v for k, v in result.items() if k != "owners"})
-            )
-            _qualify_batch(result)
+            for enabled in modes:
+                result = await _measure_batch(
+                    name,
+                    gap,
+                    samples,
+                    warm_standby_enabled=enabled,
+                    force_reconnect=os.getenv("SLNG_TTS_FORCE_RECONNECT") == "1",
+                )
+                result["repeat"] = repeat
+                results.append(result)
+                print(
+                    "BATCH_RESULT "
+                    + json.dumps({k: v for k, v in result.items() if k != "owners"})
+                )
+                _qualify_batch(result)
 
     language = os.getenv("SLNG_TTS_LANGUAGE") or "service default"
-    print(f"\n=== TTS baseline measurement: {os.environ['SLNG_TTS_MODEL']} ===")
+    print(f"\n=== TTS measurement: {os.environ['SLNG_TTS_MODEL']} ===")
     print(
         f"voice={os.environ['SLNG_TTS_VOICE']} language={language} "
         f"format=linear16/24000/mono credentials=SLNG-managed platform key"
@@ -991,6 +1054,7 @@ async def test_live_tts_warm_standby_measurement():
         rows = result["rows"]
         print(
             f"\n[{result['batch']} r{result['repeat']}] "
+            f"standby={result['warm_standby_enabled']} forced_reconnect={result['forced_reconnect']} "
             f"gap={result['gap']}s n={len(rows)} "
             f"valid={sum(1 for r in rows if r['valid'])} "
             f"sockets={result['sockets']} peak_owned={result['peak_owned']} "
@@ -1025,7 +1089,7 @@ async def test_live_tts_warm_standby_measurement():
         medians = [
             _median([r["request_to_audio"] for r in res["rows"][1:] if r["valid"]])
             for res in results
-            if res["batch"] == name
+            if res["batch"] == name and not res["warm_standby_enabled"]
         ]
         print(f"  {name}: " + ", ".join(_fmt(m) for m in medians))
 
@@ -1075,6 +1139,7 @@ async def test_live_sarvam_speech():
         voice=_SARVAM_TTS_VOICE,
         language=Language.EN_IN,
         sample_rate=_SARVAM_RATE,
+        warm_standby_enabled=os.getenv("SLNG_TTS_STANDBY_COMPARE") == "1",
     )
 
     sockets = {"tts": [], "stt": []}
