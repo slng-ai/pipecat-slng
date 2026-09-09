@@ -1865,8 +1865,7 @@ async def test_dying_route_recovers_then_rebuilds_between_turns(monkeypatch):
         await fakes[0].feed(json.dumps({"type": "audio_end"}))
 
         # Turn 2 lands on the spent stream and is rejected.
-        if not await _wait_for_text(fakes[0], timeout=3.0):
-            return
+        await _await_sent(fakes[0], "flush", 2)
         await fakes[0].feed(
             json.dumps(
                 {
@@ -1877,6 +1876,8 @@ async def test_dying_route_recovers_then_rebuilds_between_turns(monkeypatch):
         )
         if not await _wait_for_connections(fakes, 2, timeout=3.0):
             return
+        await _await_sent(fakes[1], "flush")
+        await fakes[1].feed(b"\x05\x06" * 64)
         await fakes[1].feed(json.dumps({"type": "audio_end"}))
 
         # Turn 3 must land on a session rebuilt before its text went out.
@@ -1885,6 +1886,7 @@ async def test_dying_route_recovers_then_rebuilds_between_turns(monkeypatch):
         if not await _wait_for_text(fakes[2], timeout=3.0):
             return
         await fakes[2].feed(third_audio)
+        await fakes[2].feed(json.dumps({"type": "audio_end"}))
 
     driver = asyncio.create_task(drive())
     try:
@@ -2215,6 +2217,26 @@ async def test_reconciled_stale_flush_and_control_messages_are_isolated():
     assert tts._websocket is current
     await tts.flush_audio("B")
     assert _sent_types(current) == ["flush", "flush"]
+    # A retired error may have passed its first identity check before waiting
+    # for a concurrent replacement to finish opening under the socket lock.
+    errors = []
+
+    async def push_error(**kwargs):
+        errors.append(kwargs["error_msg"])
+
+    tts.push_error = push_error
+    tts._websocket = old
+    await tts._connect_lock.acquire()
+    delayed = asyncio.create_task(
+        tts._process_message({"type": "error", "message": "expired idle session"}, old)
+    )
+    await asyncio.sleep(0)
+    tts._websocket = current
+    tts._connect_lock.release()
+    await delayed
+    assert errors == []
+    assert current.state is State.OPEN
+    assert _texts_on(current) == []
     await old.close()
     await current.close()
 
@@ -2541,3 +2563,151 @@ async def test_old_unfinished_context_cannot_retire_replacement(monkeypatch):
     assert {f.context_id for f in _audio(down)} == {_stops(down)[0].context_id}
     assert len(sockets) == 2 and all(ws.state is State.CLOSED for ws in sockets)
     assert any(isinstance(f, ErrorFrame) for f in [*down, *up])  # A fails visibly.
+
+
+@pytest.mark.parametrize("outcome", ["success", "voiced", "repeated", "multiple"])
+async def test_closed_socket_retries_only_one_unvoiced_turn(monkeypatch, outcome):
+    """A completed socket dying after B's flush cannot silently lose B."""
+    from conftest import FakeWebSocket
+
+    async def ping(self):
+        return None
+
+    monkeypatch.setattr(FakeWebSocket, "ping", ping, raising=False)
+    fakes = _collect_sockets(monkeypatch)
+    tts = _make_tts()
+    first, second, last = (bytes([n]) * 200 for n in (11, 22, 33))
+    next_turn, recovered, finished = (asyncio.Event() for _ in range(3))
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not next_turn.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield LLMFullResponseStartFrame()
+        yield TextFrame("Hello there. ")
+        yield TextFrame("How are you? ")
+        yield LLMFullResponseEndFrame()
+        if outcome == "multiple":
+            yield TTSSpeakFrame(text="Also pending")
+        while not recovered.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="C")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.2)
+
+    async def serve():
+        await _await_sockets(fakes, 1)
+        await _await_sent(fakes[0], "flush")
+        await fakes[0].feed(first)
+        await fakes[0].feed(json.dumps({"type": "audio_end"}))
+        while tts._wire:
+            await asyncio.sleep(0.001)
+        next_turn.set()
+        await _await_sent(fakes[0], "flush", 3 if outcome == "multiple" else 2)
+        if outcome == "voiced":
+            # Queue audio immediately before EOF: it must be consumed before
+            # deciding whether the turn is eligible for replay.
+            await fakes[0].feed(second)
+        await fakes[0].close()
+        await _await_sockets(fakes, 2)
+        if outcome in ("success", "repeated"):
+            # On the unfixed adapter this times out: B has been discarded.
+            await _await_sent(fakes[1], "flush")
+            if outcome == "success":
+                await fakes[1].feed(second)
+                await fakes[1].feed(json.dumps({"type": "audio_end"}))
+                while tts._wire:
+                    await asyncio.sleep(0.001)
+            else:
+                await fakes[1].close()
+                await _await_sockets(fakes, 3)
+        recovered.set()
+        while not any("C" in _texts_on(ws) for ws in fakes[1:]):
+            await asyncio.sleep(0.001)
+        current = next(ws for ws in fakes[1:] if "C" in _texts_on(ws))
+        await _await_sent(current, "flush")
+        await current.feed(last)
+        await current.feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 8)
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    original = _texts_on(fakes[0])[1:]
+    replays = [_texts_on(ws) for ws in fakes[1:]]
+    if outcome in ("success", "repeated"):
+        assert original == ["Hello there.", "How are you?"]
+        assert replays[0] == original
+        assert not any(text in original for sends in replays[1:] for text in sends)
+    else:
+        assert not any(text in original for sends in replays for text in sends)
+    expected = (
+        [first, second, last] if outcome in ("success", "voiced") else [first, last]
+    )
+    assert [f.audio for f in _audio(down)] == expected
+    stops = [f.context_id for f in _stops(down)]
+    assert len(stops) == len(set(stops)) == (3 if outcome == "success" else 2)
+    assert bool([f for f in [*down, *up] if isinstance(f, ErrorFrame)]) == (
+        outcome != "success"
+    )
+    assert all(ws.state is State.CLOSED for ws in fakes)
+    assert tts._websocket is tts._receive_task is tts._keepalive_task is None
+
+
+async def test_completed_idle_session_error_reconnects_on_next_request(monkeypatch):
+    """Provider idle expiry neither fails completed speech nor opens idle loops."""
+    fakes = _collect_sockets(monkeypatch)
+    tts = _make_tts()
+    expired, finished = asyncio.Event(), asyncio.Event()
+    first, second = b"\x11\x22" * 2400, b"\x33\x44" * 100
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not expired.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="B")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.2)
+
+    async def serve():
+        await _await_sockets(fakes, 1)
+        await _await_sent(fakes[0], "flush")
+        await fakes[0].feed(first)
+        await fakes[0].feed(json.dumps({"type": "audio_end"}))
+        # The error follows the completed synthesis while playback still drains.
+        await fakes[0].feed(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "Session produced no output for 120 seconds",
+                }
+            )
+        )
+        await asyncio.sleep(0.2)
+        assert len(fakes) == 1, "idle expiry must not open another idle session"
+        assert fakes[0].state is State.CLOSED
+        expired.set()
+        await _await_sockets(fakes, 2)
+        await _await_sent(fakes[1], "flush")
+        await fakes[1].feed(second)
+        await fakes[1].feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 5)
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    assert [f.audio for f in _audio(down)] == [first, second]
+    assert [f.context_id for f in _stops(down)] == [f.context_id for f in _audio(down)]
+    assert not [f.error for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert len(fakes) == 2 and all(ws.state is State.CLOSED for ws in fakes)
+    assert tts._websocket is tts._receive_task is tts._keepalive_task is None

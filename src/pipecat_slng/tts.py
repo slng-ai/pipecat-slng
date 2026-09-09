@@ -229,6 +229,7 @@ class SlngTTSService(WebsocketTTSService):
         self._connect_lock = asyncio.Lock()
         self._session_dies_per_utterance = False
         self._pending_resend: _WireTurn | None = None
+        self._idle_expired = False
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -272,7 +273,9 @@ class SlngTTSService(WebsocketTTSService):
     async def _connect(self):
         await super()._connect()
         await self._connect_websocket()
-        if self._websocket and not self._receive_task:
+        if self._websocket and (
+            self._receive_task is None or self._receive_task.done()
+        ):
             self._receive_task = self.create_task(
                 self._receive_task_handler(self._report_error)
             )
@@ -338,6 +341,17 @@ class SlngTTSService(WebsocketTTSService):
         """The turn that owns the next output arriving on ``ws``."""
         return next((t for t in self._wire if t.socket is ws), None)
 
+    def _unvoiced_turn_to_retry(self, ws) -> _WireTurn | None:
+        turn = self._wire_head(ws)
+        return (
+            turn
+            if len(self._wire) == 1
+            and turn is not None
+            and not turn.has_audio
+            and not turn.retried
+            else None
+        )
+
     async def _complete_wire_turn(self, ws: Any):
         """Finish the turn a terminal message on ``ws`` belongs to, exactly once.
 
@@ -375,30 +389,38 @@ class SlngTTSService(WebsocketTTSService):
     ):
         """Invalidate anonymous output before replacing a failed/abandoned stream.
 
-        Only a single unvoiced turn may be retried after a server error. An
+        Only a single unvoiced turn may be retried after a server error or EOF. An
         interruption, timeout, or ambiguous multi-turn failure is never replayed.
         Close the old transport before awaiting a replacement handshake, retaining
         its reference until closure so cancellation cannot orphan it.
         """
         async with self._connect_lock:
-            old = self._websocket
-            if (
-                old is None
-                or self._disconnecting
-                or (expected_socket is not None and old is not expected_socket)
-            ):
-                return
-            logger.debug(f"{self}: retiring TTS stream ({reason})")
-            self._pending_resend = replay
-            self._retiring = old
-            self._websocket = None
-            self._ready_event.clear()
-            self._expect_server_close = False
-            self._expect_server_close_reason = None
-            await self._abandon_wire_turns(old, reason, replay)
-            await self._close_retiring_socket()
-            if not self._disconnecting:
-                await self._connect_websocket_locked()
+            await self._retire_stream_locked(reason, replay, expected_socket)
+
+    async def _retire_stream_locked(
+        self, reason, replay, expected_socket, *, reconnect=True
+    ):
+        """Share retirement with receiver recovery while holding the socket lock."""
+        old = self._websocket
+        if (
+            old is None
+            or self._disconnecting
+            or (expected_socket is not None and old is not expected_socket)
+        ):
+            return
+        logger.debug(f"{self}: retiring TTS stream ({reason})")
+        self._pending_resend = replay
+        if replay is not None:
+            replay.retried = True
+        self._retiring = old
+        self._websocket = None
+        self._ready_event.clear()
+        self._expect_server_close = False
+        self._expect_server_close_reason = None
+        await self._abandon_wire_turns(old, reason, replay)
+        await self._close_retiring_socket()
+        if reconnect and not self._disconnecting:
+            await self._connect_websocket_locked()
 
     async def _close_retiring_socket(self):
         old = self._retiring
@@ -467,6 +489,7 @@ class SlngTTSService(WebsocketTTSService):
             if self._settings.voice:
                 init_msg["voice"] = str(self._settings.voice)
             await self._websocket.send(json.dumps(init_msg))
+            self._idle_expired = False
 
             await self._call_event_handler("on_connected")
         except BaseException as e:
@@ -502,9 +525,14 @@ class SlngTTSService(WebsocketTTSService):
             )
         finally:
             # Only one socket is ever in use, so closing it abandons every turn
-            # outstanding on the wire. Their callers see pipecat's existing
-            # zero-audio/context outcome; no text is replayed.
-            self._wire.clear()
+            # outstanding on the wire. Unexpected loss is reported for each
+            # affected context; intentional shutdown does not retry speech.
+            if self._disconnecting:
+                self._wire.clear()
+            else:
+                await self._abandon_wire_turns(
+                    ws, "connection closed before completion"
+                )
             self._pending_resend = None
             await self.stop_all_metrics()
             await self.remove_active_audio_context()
@@ -534,13 +562,16 @@ class SlngTTSService(WebsocketTTSService):
         A stream we retired ourselves already has its replacement open, so the
         loop just continues on it — no reconnect, no failure accounting.
 
-        Unexpected closes (flag unset) keep the full base class behavior.
+        A closed stream can retry one wholly unvoiced turn once. Other
+        unexpected closes keep the full base class behavior.
         """
         async with self._connect_lock:
             if self._retiring is not None:
                 await self._close_retiring_socket()
                 self._retiring = None
                 await self._call_event_handler("on_disconnected")
+                if self._idle_expired and self._websocket is None:
+                    return False
                 await self._connect_websocket_locked()
                 return not self._disconnecting and self._websocket is not None
 
@@ -551,6 +582,27 @@ class SlngTTSService(WebsocketTTSService):
             ):
                 # run_tts may already have replaced a CLOSED transport before its
                 # receiver consumes EOF. The old callback owns no part of B.
+                return not self._disconnecting and self._websocket is not None
+
+            ws = self._websocket
+            if (
+                not self._disconnecting
+                and ws is not None
+                and ws is self._receiving_socket
+                and ws.state is State.CLOSED
+                and (replay := self._unvoiced_turn_to_retry(ws)) is not None
+            ):
+                # The receiver consumed all queued output before reaching EOF.
+                # ponytail: retry only one wholly unvoiced turn; provider work
+                # may repeat. A gateway request-ack contract could remove that ambiguity.
+                logger.info(f"{self}: retrying unvoiced TTS turn after socket closure")
+                self._session_dies_per_utterance = True
+                await self._retire_stream_locked(
+                    "closed before first audio", replay, ws
+                )
+                # This callback already consumed the retired stream's EOF.
+                self._retiring = None
+                await self._call_event_handler("on_disconnected")
                 return not self._disconnecting and self._websocket is not None
 
             if self._expect_server_close and not self._disconnecting:
@@ -817,6 +869,27 @@ class SlngTTSService(WebsocketTTSService):
                 or data.get("code")
                 or f"Unknown SLNG TTS error (payload: {data})"
             )
+            async with self._connect_lock:
+                current = self._websocket
+                if ws is not None and ws is not current:
+                    return
+                if (
+                    current is not None
+                    and self._expect_server_close
+                    and not self._wire
+                    and self._pending_resend is None
+                    and not self._disconnecting
+                ):
+                    # The completed speech still has queued playback; expire only
+                    # its idle transport and keep the provider detail in diagnostics.
+                    logger.warning(
+                        f"{self}: completed idle TTS session ended: {error_msg}"
+                    )
+                    self._idle_expired = True
+                    await self._retire_stream_locked(
+                        "idle session ended", None, current, reconnect=False
+                    )
+                    return
             logger.error(f"{self}: SLNG TTS error: {error_msg}")
             await self.push_error(error_msg=str(error_msg))
             await self.stop_all_metrics()
@@ -826,15 +899,7 @@ class SlngTTSService(WebsocketTTSService):
                 self._session_dies_per_utterance = True
                 # Preserve main's retry-before-audio behavior only when ownership
                 # is unambiguous. Never replay a voiced turn or loop on errors.
-                turn = self._wire_head(self._websocket)
-                replay = (
-                    turn
-                    if len(self._wire) == 1
-                    and turn is not None
-                    and not turn.has_audio
-                    and not turn.retried
-                    else None
-                )
+                replay = self._unvoiced_turn_to_retry(self._websocket)
                 await self._retire_stream(
                     "server error",
                     replay,

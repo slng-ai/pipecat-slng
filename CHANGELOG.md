@@ -15,7 +15,10 @@ to [Semantic Versioning](https://semver.org/).
 - Preserve recovery for sessions that die between utterances: healthy routes reuse
   their connection, while a route that has failed rebuilds at the next turn start
   once its prior synthesis finishes. A server error can retry one unvoiced turn
-  once, retaining all submitted fragments and its flush. Voiced turns, multiple
+  once, retaining all submitted fragments and its flush. A verified socket closure
+  after queued output has drained can also retry a single wholly unvoiced turn
+  once. This preserves speech when a completed connection closes after the next
+  text/flush; upstream processing or billing may repeat. Voiced turns, multiple
   outstanding turns, interruptions, and ambiguous send failures are not replayed.
 - Interruptions and abandoned synthesis retire the old transport before connecting
   its replacement. Failed ownership and old-socket control messages cannot affect
@@ -24,6 +27,10 @@ to [Semantic Versioning](https://semver.org/).
 - A closing transport finishes closing before a replacement opens. Unfinished
   contexts from that transport fail visibly and cannot later retire or truncate
   speech on the replacement.
+- An error on a completed idle session closes that transport and reconnects on
+  the next request, preserving buffered playback. Idle expiration is logged;
+  startup and in-flight errors remain visible to the pipeline. Verified against
+  Pipecat 1.8.0, including Gradium's reported 120-second no-output expiry.
 - Reject `reuse_context_id_within_turn=False` before connecting because the bridge's
   anonymous stream cannot attribute audio to separate fragment contexts.
 
