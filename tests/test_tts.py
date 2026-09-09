@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.observers.base_observer import FramePushed
+from pipecat.transcriptions.language import Language
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
 
@@ -979,7 +980,8 @@ async def test_tts_completion_keeps_the_socket_open(monkeypatch):
     assert not [f for f in up if isinstance(f, ErrorFrame)]
 
 
-async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch, enabled):
     """An abandoned turn's stream is dropped before a new turn uses it.
 
     `cleared` is not a portable drain barrier across gateway runtimes, so audio
@@ -987,7 +989,9 @@ async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch):
     Keeping that stream would credit it to the next utterance.
     """
     fakes = _collect_sockets(monkeypatch)
-    tts = _make_tts()
+    tts = SlngTTSService(
+        api_key="test", sample_rate=24000, warm_standby_enabled=enabled
+    )
     stale, fresh = b"\x99\x99" * 100, b"\x33\x33" * 100
 
     async def serve():
@@ -1017,6 +1021,8 @@ async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch):
 
     assert [f.audio for f in _audio(down)] == [fresh]
     assert len(_stops(down)) == 1
+
+    assert all(ws.state is State.CLOSED for ws in fakes)
 
 
 async def test_tts_zero_audio_terminal_still_completes_the_context(patch_ws):
@@ -1078,7 +1084,10 @@ async def test_tts_empty_input_creates_no_utterance(patch_ws):
     assert not _stops(down)
 
 
-async def test_tts_rejects_per_fragment_contexts_before_connecting(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_tts_rejects_per_fragment_contexts_before_connecting(
+    monkeypatch, enabled
+):
     """Explicit per-fragment contexts are refused, not silently overridden.
 
     The bridge returns one unlabelled stream per input turn, so fragment-sized
@@ -1092,6 +1101,7 @@ async def test_tts_rejects_per_fragment_contexts_before_connecting(monkeypatch):
             voice="aura-2-thalia-en",
             sample_rate=24000,
             reuse_context_id_within_turn=False,
+            warm_standby_enabled=enabled,
         )
 
     assert not fakes, "the configuration must be rejected before any connection"
@@ -1146,10 +1156,10 @@ async def _replay(script, texts):
 
     for at, kind, payload in script:
         stamp = int(at * 1e9)
-        if kind == "wire":
+        if kind in ("wire", "spare_wire"):
             service.seconds = at
             name, nbytes = payload if isinstance(payload, tuple) else (payload, 0)
-            log.mark(1, name, nbytes, b"\x00" * nbytes)
+            log.mark(2 if kind == "spare_wire" else 1, name, nbytes, b"\x00" * nbytes)
             continue
         if kind == "send":
             service.seconds = at
@@ -2711,3 +2721,723 @@ async def test_completed_idle_session_error_reconnects_on_next_request(monkeypat
     assert not [f.error for f in [*down, *up] if isinstance(f, ErrorFrame)]
     assert len(fakes) == 2 and all(ws.state is State.CLOSED for ws in fakes)
     assert tts._websocket is tts._receive_task is tts._keepalive_task is None
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+async def test_tts_warm_standby_selection(monkeypatch, enabled):
+    """A ready spare takes the whole next utterance before old close finishes."""
+    from conftest import FakeWebSocket
+    from loguru import logger
+
+    sockets, outcomes = [], []
+    release_close, next_turn, finished = (asyncio.Event() for _ in range(3))
+    maximum = 0
+
+    async def connect(*args, **kwargs):
+        nonlocal maximum
+        assert sum(ws.state is not State.CLOSED for ws in sockets) < (
+            2 if enabled else 1
+        )
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        maximum = max(maximum, sum(s.state is not State.CLOSED for s in sockets))
+        if enabled and len(sockets) == 1:
+            close = ws.close
+
+            async def slow_close():
+                ws.state = State.CLOSING
+                await release_close.wait()
+                await close()
+
+            monkeypatch.setattr(ws, "close", slow_close)
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    options = {} if enabled is None else {"warm_standby_enabled": enabled}
+    tts = SlngTTSService(
+        api_key="test-key", voice="voice", sample_rate=24000, **options
+    )
+    sink = logger.add(
+        lambda message: (
+            outcomes.append(message.record["extra"]["slng_warm_standby"])
+            if "slng_warm_standby" in message.record["extra"]
+            else None
+        )
+    )
+    first, second = b"\x11\x22" * 100, b"\x33\x44" * 100
+
+    def frames():
+        yield LLMFullResponseStartFrame()
+        yield TextFrame("First sentence. ")
+        yield TextFrame("Second sentence. ")
+        yield LLMFullResponseEndFrame()
+        while not next_turn.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="Next utterance")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.15)
+
+    async def serve():
+        try:
+            await _await_sockets(sockets, 1)
+            await _await_sent(sockets[0], "flush")
+            if enabled:
+                await _await_sockets(sockets, 2)
+                # Let the spare's ready pass through its own reader.
+                await asyncio.sleep(0.03)
+                assert _texts_on(sockets[1]) == []
+            await sockets[0].feed(first)
+            await sockets[0].feed(json.dumps({"type": "audio_end"}))
+            next_turn.set()
+            target = sockets[1] if enabled else sockets[0]
+            await _await_sent(target, "flush", 1 if enabled else 2)
+            if enabled:
+                assert sockets[0].state is State.CLOSING
+                assert len(sockets) == 2
+                assert _texts_on(sockets[0]) == ["First sentence.", "Second sentence."]
+                assert _texts_on(target) == ["Next utterance"]
+            await target.feed(second)
+            await target.feed(json.dumps({"type": "audio_end"}))
+        finally:
+            release_close.set()
+            finished.set()
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 8)
+        await server
+    finally:
+        release_close.set()
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        logger.remove(sink)
+    assert [f.audio for f in _audio(down)] == [first, second]
+    assert [f.context_id for f in _stops(down)] == [f.context_id for f in _audio(down)]
+    assert not [f for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert maximum == (2 if enabled else 1)
+    assert all(ws.state is State.CLOSED for ws in sockets)
+    assert len(outcomes) == 2
+    assert outcomes[0]["miss_reason"] == (
+        "initial_connection" if enabled else "disabled"
+    )
+    assert outcomes[1]["used"] is bool(enabled)
+    if enabled:
+        assert outcomes[1]["miss_reason"] is None
+        assert outcomes[1]["prepared_ms"] >= 0
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["pending", "not_ready", "failed", "quota", "closed", "audio", "terminal"],
+)
+async def test_tts_warm_standby_fallback(monkeypatch, failure):
+    """Unavailable preparation never delays otherwise working active speech."""
+    from conftest import FakeWebSocket
+    from loguru import logger
+
+    sockets, outcomes = [], []
+    opening, release, next_turn, finished = (asyncio.Event() for _ in range(4))
+    attempts = 0
+
+    async def connect(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            opening.set()
+            if failure == "pending":
+                await release.wait()
+            if failure in ("failed", "quota"):
+                raise ConnectionError(
+                    "quota denied" if failure == "quota" else "test connection failure"
+                )
+        assert sum(ws.state is not State.CLOSED for ws in sockets) < 2
+        initial = (
+            []
+            if attempts == 2 and failure == "not_ready"
+            else [json.dumps({"type": "ready"})]
+        )
+        ws = FakeWebSocket(initial)
+        sockets.append(ws)
+        if attempts == 2:
+            if failure == "closed":
+                await ws.close()
+            elif failure == "audio":
+                await ws.feed(b"unexpected standby audio")
+            elif failure == "terminal":
+                await ws.feed(json.dumps({"type": "audio_end"}))
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = SlngTTSService(
+        api_key="secret-test-key",
+        voice="voice",
+        sample_rate=24000,
+        warm_standby_enabled=True,
+    )
+    sink = logger.add(
+        lambda message: (
+            outcomes.append(message.record["extra"]["slng_warm_standby"])
+            if "slng_warm_standby" in message.record["extra"]
+            else None
+        )
+    )
+    payloads = [b"\x01\x02" * 100, b"\x03\x04" * 100]
+
+    def frames():
+        yield TTSSpeakFrame(text="private first speech")
+        while not next_turn.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="private second speech")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.15)
+
+    async def serve():
+        await _await_sockets(sockets, 1)
+        await _await_sent(sockets[0], "flush")
+        await opening.wait()
+        await asyncio.sleep(0.03)
+        await sockets[0].feed(payloads[0])
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+        next_turn.set()
+        await _await_sent(sockets[0], "flush", 2)
+        # The second text reached the active wire before pending preparation
+        # was allowed to connect or obtain its ready acknowledgement.
+        assert not release.is_set()
+        await sockets[0].feed(payloads[1])
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+        release.set()
+        finished.set()
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 8)
+        await server
+    finally:
+        release.set()
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        logger.remove(sink)
+    assert [f.audio for f in _audio(down)] == payloads
+    assert len(_stops(down)) == 2
+    assert not [f for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    expected = failure if failure in ("pending", "not_ready", "closed") else "failed"
+    assert outcomes[1]["miss_reason"] == expected and not outcomes[1]["used"]
+    assert "private" not in json.dumps(
+        outcomes
+    ) and "secret-test-key" not in json.dumps(outcomes)
+    assert attempts <= 3
+    assert all(ws.state is State.CLOSED for ws in sockets)
+
+
+@pytest.mark.parametrize("completion", ["terminal", "timeout"])
+async def test_tts_warm_standby_audio_isolation(monkeypatch, completion):
+    """B waits for A's final audio, then uses a spare while A playback drains."""
+    fakes = _collect_sockets(monkeypatch)
+    tts = SlngTTSService(
+        api_key="test-key",
+        voice="voice",
+        sample_rate=24000,
+        warm_standby_enabled=True,
+        stop_frame_timeout_s=0.1 if completion == "timeout" else 3.0,
+    )
+    first, tail, second = (bytes([n]) * 100 for n in (11, 22, 33))
+
+    async def serve():
+        await _await_sockets(fakes, 2)
+        await _await_sent(fakes[0], "flush")
+        await fakes[0].feed(first)
+        await asyncio.sleep(0.03)
+        assert _texts_on(fakes[0]) == ["A first.", "A last."]
+        assert _texts_on(fakes[1]) == []
+        await fakes[0].feed(tail)
+        if completion == "terminal":
+            await fakes[0].feed(json.dumps({"type": "audio_end"}))
+        await _await_sent(fakes[1], "flush")
+        # A delayed control callback and trailing transport traffic have no
+        # authority over the new connection's context or readiness.
+        await tts._process_message({"type": "audio_end"}, fakes[0])
+        await tts._handle_audio_bytes(b"stale", fakes[0])
+        await fakes[1].feed(second)
+        await fakes[1].feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts,
+            frames_to_send=[
+                LLMFullResponseStartFrame(),
+                TextFrame("A first. "),
+                TextFrame("A last. "),
+                LLMFullResponseEndFrame(),
+                TTSSpeakFrame(text="B"),
+                SleepFrame(sleep=0.4),
+            ],
+        )
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    assert [f.audio for f in _audio(down)] == [first, tail, second]
+    contexts = [f.context_id for f in _audio(down)]
+    assert contexts[0] == contexts[1] != contexts[2]
+    assert [f.context_id for f in _stops(down)] == (
+        [contexts[0], contexts[2]] if completion == "terminal" else [contexts[2]]
+    )
+    errors = [f for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert bool(errors) is (completion == "timeout")
+    assert all(ws.state is State.CLOSED for ws in fakes)
+
+
+@pytest.mark.parametrize("phase", ["opening", "ready", "noop"])
+async def test_tts_warm_standby_settings(monkeypatch, phase):
+    """Changing effective settings invalidates only obsolete preparations."""
+    from conftest import FakeWebSocket
+
+    sockets, calls = [], []
+    entered, next_turn, finished = (asyncio.Event() for _ in range(3))
+    pronunciation = {"name": "before"}
+
+    async def connect(url, **kwargs):
+        call = len(calls)
+        calls.append((url, dict(kwargs["additional_headers"])))
+        if call == 1 and phase == "opening":
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # An acquired socket returned late still belongs to the canceled
+                # opener and must be closed, never published with stale settings.
+                pass
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        if call == 1:
+            entered.set()
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = SlngTTSService(
+        api_key="test-key",
+        model="gradium/tts:default",
+        voice="before",
+        sample_rate=24000,
+        language=Language.EN,
+        pronunciation=pronunciation,
+        region_override="eu-north-1",
+        provider_key="provider-test-key",
+        warm_standby_enabled=True,
+    )
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not next_turn.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield TTSSpeakFrame(text="B")
+        while not finished.is_set():
+            yield SleepFrame(sleep=0.01)
+        yield SleepFrame(sleep=0.15)
+
+    async def serve():
+        await _await_sockets(sockets, 1)
+        await _await_sent(sockets[0], "flush")
+        await entered.wait()
+        await sockets[0].feed(b"\x11\x22" * 100)
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+        while tts._wire:
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.03)
+        if phase == "noop":
+            await tts._update_settings(SlngTTSSettings(voice="before"))
+            assert len(calls) == 2
+        else:
+            await tts._update_settings(
+                SlngTTSSettings(
+                    voice="after",
+                    language=Language.HI,
+                    speed=1.1,
+                    pronunciation={"name": "after"},
+                )
+            )
+            assert sockets[1].state is State.CLOSED
+            assert _texts_on(sockets[1]) == []
+        next_turn.set()
+        while not any("B" in _texts_on(ws) for ws in sockets):
+            await asyncio.sleep(0.001)
+        target = next(ws for ws in sockets if "B" in _texts_on(ws))
+        await _await_sent(target, "flush")
+        init = json.loads(target.sent[0])
+        assert init["voice"] == ("before" if phase == "noop" else "after")
+        if phase != "noop":
+            assert init["config"]["language"] == "hi"
+            assert init["config"]["speed"] == 1.1
+            assert init["config"]["pronunciation"] == {"name": "after"}
+        assert all(url.endswith("/gradium/tts:default") for url, _ in calls)
+        assert all(
+            headers
+            == {
+                "Authorization": "Bearer test-key",
+                "X-Region-Override": "eu-north-1",
+                "X-Slng-Provider-Key": "provider-test-key",
+            }
+            for _, headers in calls
+        )
+        await target.feed(b"\x33\x44" * 100)
+        await target.feed(json.dumps({"type": "audio_end"}))
+        finished.set()
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await asyncio.wait_for(run_test(tts, frames_to_send=frames()), 8)
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    assert [f.audio for f in _audio(down)] == [b"\x11\x22" * 100, b"\x33\x44" * 100]
+    assert len(_stops(down)) == 2
+    assert not [f for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert all(ws.state is State.CLOSED for ws in sockets)
+
+
+@pytest.mark.parametrize("phase", ["opening", "ready", "promotion"])
+@pytest.mark.parametrize("ending", ["stop", "cancel"])
+async def test_tts_warm_standby_cleanup(monkeypatch, phase, ending):
+    """All sockets remain owned through shutdown, including handoff cancellation."""
+    from conftest import FakeWebSocket
+    from pipecat.frames.frames import CancelFrame
+
+    sockets = []
+    entered, first_done, promoting = (asyncio.Event() for _ in range(3))
+
+    async def connect(*args, **kwargs):
+        if len(sockets) == 1 and phase == "opening":
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        if len(sockets) == 2:
+            entered.set()
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts = SlngTTSService(
+        api_key="test-key", voice="voice", sample_rate=24000, warm_standby_enabled=True
+    )
+    prepare = tts._prepare_standby
+
+    async def delayed_prepare(generation):
+        try:
+            await prepare(generation)
+        finally:
+            if phase == "promotion" and not tts._disconnecting:
+                promoting.set()
+                await asyncio.sleep(0.1)
+
+    monkeypatch.setattr(tts, "_prepare_standby", delayed_prepare)
+
+    def frames():
+        yield TTSSpeakFrame(text="A")
+        while not first_done.is_set():
+            yield SleepFrame(sleep=0.01)
+        if phase == "promotion":
+            yield TTSSpeakFrame(text="B")
+            while not promoting.is_set():
+                yield SleepFrame(sleep=0.01)
+        if ending == "cancel":
+            yield CancelFrame()
+
+    async def serve():
+        await _await_sockets(sockets, 1)
+        await _await_sent(sockets[0], "flush")
+        await entered.wait()
+        await sockets[0].feed(b"\x11\x22" * 100)
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+        await asyncio.sleep(0.03)
+        first_done.set()
+        if phase == "promotion" and ending == "stop":
+            await _await_sent(sockets[1], "flush")
+            await sockets[1].feed(b"\x33\x44" * 100)
+            await sockets[1].feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        await asyncio.wait_for(
+            run_test(tts, frames_to_send=frames(), send_end_frame=ending == "stop"), 8
+        )
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    await tts.cleanup()
+    await tts.cleanup()
+    assert all(ws.state is State.CLOSED for ws in sockets)
+    assert tts._websocket is tts._standby_ws is tts._standby_retiring is None
+    assert tts._receive_task is tts._keepalive_task is tts._standby_task is None
+    assert tts._standby_close_task is None or tts._standby_close_task.done()
+    count = len(sockets)
+    await asyncio.sleep(0.03)
+    assert len(sockets) == count
+
+
+@pytest.mark.parametrize("standby", [False, True])
+async def test_tts_warm_standby_failed_close_ownership(monkeypatch, standby):
+    """Failed init/close retains ownership, and cannot prevent active teardown."""
+    from conftest import FakeWebSocket
+
+    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    active, broken = FakeWebSocket(), FakeWebSocket()
+    close = broken.close
+
+    async def fail(*args, **kwargs):
+        raise ConnectionError("injected failure")
+
+    async def connect(*args, **kwargs):
+        return broken
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    monkeypatch.setattr(broken, "send", fail)
+    monkeypatch.setattr(broken, "close", fail)
+    with pytest.raises(ConnectionError):
+        await tts._open_socket(tts._connection_options(), standby=standby)
+    assert broken.state is State.OPEN
+    assert (tts._standby_ws if standby else tts._websocket) is broken
+    if standby:
+        tts._websocket = active
+        with pytest.raises(ConnectionError):
+            await tts._disconnect()
+        assert active.state is State.CLOSED
+        assert tts._standby_ws is broken
+    monkeypatch.setattr(broken, "close", close)
+    # The failed init is still owned and can be closed on the next cleanup.
+    await tts.cleanup()
+    assert broken.state is State.CLOSED
+    assert tts._websocket is tts._standby_ws is None
+
+
+async def test_tts_warm_standby_buffered_audio(monkeypatch):
+    """Queued unsolicited audio invalidates a ready spare at handoff."""
+    from conftest import FakeWebSocket
+
+    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    active = FakeWebSocket()
+    spare = FakeWebSocket([json.dumps({"type": "ready"})])
+    tts._websocket = active
+    monkeypatch.setattr(tts, "create_task", asyncio.create_task)
+
+    async def connect(*args, **kwargs):
+        return spare
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    tts._start_standby()
+    while not tts._standby_ready:
+        await asyncio.sleep(0)
+    await spare.feed(b"unsolicited before any text")
+    used, reason, _ = await tts._select_standby()
+    assert not used and reason == "failed"
+    assert tts._websocket is active and active.state is State.OPEN
+    assert spare.state is State.CLOSED and not _texts_on(spare)
+    await tts.cleanup()
+
+
+async def test_tts_replacement_waits_for_own_ready(monkeypatch):
+    """A prior ready cannot let replacement text bypass the init handshake."""
+    from conftest import FakeWebSocket
+
+    tts = SlngTTSService(api_key="test")
+    old, new = FakeWebSocket(), FakeWebSocket()
+    await old.close()
+    tts._websocket = old
+    tts._ready_event.set()
+
+    async def connect(*args, **kwargs):
+        return new
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    await tts._connect_websocket()
+    task = asyncio.create_task(anext(tts.run_tts("Hello", "context")))
+    await asyncio.sleep(0.02)
+    assert not _texts_on(new)
+    await tts._process_message({"type": "ready"}, new)
+    assert await task is None
+    assert _texts_on(new) == ["Hello"]
+    await tts.cleanup()
+
+
+async def test_measurement_standby_qualification():
+    """A spare cannot supply another socket's setup, audio, or claimed hit."""
+    from test_live_smoke import _spans
+
+    rows, observed, wire = await _replay(
+        sorted(
+            _one_turn()
+            + [
+                (0.35, "spare_wire", "connect_start"),
+                (0.46, "spare_wire", "recv:ready"),
+                (0.55, "spare_wire", ("audio", 800)),
+                (0.6, "spare_wire", "recv:audio_end"),
+            ]
+        ),
+        ["one"],
+    )
+    assert rows[0]["valid"]
+    assert rows[0]["foreground_setup"] == ["recv:ready"]
+    assert rows[0]["received_bytes"] == 400
+    assert rows[0]["request_to_audio"] == pytest.approx(0.5)
+    turns = [dict(index=0, context_id="ctx-a", attempt_at=0.45, sent_ok=True)]
+    # A claimed hit cannot borrow readiness from the other socket.
+    wire.selections["ctx-a"] = dict(enabled=True, used=True, at=0.49)
+    wire.events = [
+        event
+        for event in wire.events
+        if not (event[1] == 1 and event[2] == "recv:ready")
+    ]
+    assert not _spans(turns, observed, wire, ["one"])[0]["valid"]
+    # A genuinely ready speech socket has no foreground setup in this window.
+    wire.events.insert(0, (0.25, 1, "recv:ready", 0))
+    assert _spans(turns, observed, wire, ["one"])[0]["valid"]
+
+
+async def test_tts_warm_standby_expected_eof_and_keepalive(monkeypatch):
+    """Keepalive failure is isolated; completed EOF needs no redundant opener."""
+    from conftest import FakeWebSocket
+
+    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    active, spare = FakeWebSocket(), FakeWebSocket()
+    tts._websocket, tts._standby_ws = active, spare
+    tts._standby_ready = True
+    tts._standby_options = tts._connection_options()
+    monkeypatch.setattr(tts, "create_task", asyncio.create_task)
+
+    async def cancel_task(task):
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    monkeypatch.setattr(tts, "cancel_task", cancel_task)
+    monkeypatch.setattr("pipecat_slng.tts._KEEPALIVE_INTERVAL", 0.01)
+
+    async def fail_send(*args, **kwargs):
+        raise ConnectionError("active keepalive failed")
+
+    async def unexpected_connect(*args, **kwargs):
+        pytest.fail("a completed EOF must leave the ready spare selectable")
+
+    monkeypatch.setattr(active, "send", fail_send)
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", unexpected_connect)
+    tts._keepalive_task = asyncio.create_task(tts._keepalive_task_handler())
+    await _await_sent(spare, "keepalive", count=2)
+    await active.close()
+    tts._receiving_socket = active
+    tts._expect_server_close = True
+    assert not await tts._maybe_try_reconnect("completed EOF", None)
+    await spare.feed(json.dumps({"type": "ready"}))  # duplicate, buffered at handoff
+    used, reason, _ = await tts._select_standby()
+    assert used and reason is None and tts._websocket is spare
+    unready = FakeWebSocket()
+
+    async def replenish(*args, **kwargs):
+        return unready
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", replenish)
+    tts._start_standby()
+    await _await_sent(unready, "init")
+    # The promoted socket's duplicate ack cannot qualify this new candidate.
+    used, reason, _ = await tts._select_standby()
+    assert not used and reason == "not_ready"
+    await tts.cleanup()
+    assert unready.state is State.CLOSED
+    assert active.state is spare.state is State.CLOSED
+
+
+async def test_tts_warm_standby_ambiguous_send_is_not_replayed(monkeypatch):
+    """Acceptance followed by a send exception cannot duplicate speech."""
+    from conftest import FakeWebSocket
+
+    sockets = []
+    tts = SlngTTSService(api_key="test", sample_rate=24000, warm_standby_enabled=True)
+
+    async def connect(*args, **kwargs):
+        ws = FakeWebSocket([json.dumps({"type": "ready"})])
+        sockets.append(ws)
+        if len(sockets) == 2:
+            send = ws.send
+
+            async def accepted(data):
+                await send(data)
+                if json.loads(data).get("type") == "text":
+                    raise ConnectionError("accepted then disconnected")
+
+            monkeypatch.setattr(ws, "send", accepted)
+        return ws
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+
+    async def serve():
+        await _await_sockets(sockets, 2)
+        await _await_sent(sockets[0], "flush")
+        await sockets[0].feed(b"\x11\x22" * 100)
+        await sockets[0].feed(json.dumps({"type": "audio_end"}))
+
+    server = asyncio.create_task(serve())
+    try:
+        down, up = await run_test(
+            tts,
+            frames_to_send=[
+                TTSSpeakFrame(text="first"),
+                SleepFrame(sleep=0.15),
+                TTSSpeakFrame(text="accepted once"),
+                SleepFrame(sleep=0.2),
+            ],
+        )
+        await server
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+    assert [text for ws in sockets for text in _texts_on(ws)].count(
+        "accepted once"
+    ) == 1
+    assert any(isinstance(f, ErrorFrame) for f in [*down, *up])
+    assert [f.audio for f in _audio(down)] == [b"\x11\x22" * 100]
+    assert all(ws.state is State.CLOSED for ws in sockets)
+
+
+async def test_tts_warm_standby_mutable_settings_during_selection(monkeypatch):
+    """Init is a snapshot; settings changed during reader join invalidate it."""
+    from conftest import FakeWebSocket
+
+    pronunciation = {"name": "before"}
+    tts = SlngTTSService(
+        api_key="test", pronunciation=pronunciation, warm_standby_enabled=True
+    )
+    active, spare = FakeWebSocket(), FakeWebSocket()
+    tts._websocket = active
+    monkeypatch.setattr(tts, "create_task", asyncio.create_task)
+
+    async def connect(*args, **kwargs):
+        return spare
+
+    monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
+    options = tts._connection_options()
+    await tts._open_socket(options, standby=True)
+    tts._standby_options, tts._standby_ready = options, True
+    watching = asyncio.Event()
+
+    async def watcher():
+        try:
+            watching.set()
+            await asyncio.Event().wait()
+        finally:
+            pronunciation["name"] = "after"
+
+    tts._standby_task = asyncio.create_task(watcher())
+    await watching.wait()
+    used, reason, _ = await tts._select_standby()
+    assert not used and reason == "settings_changed"
+    assert json.loads(spare.sent[0])["config"]["pronunciation"] == {"name": "before"}
+    assert json.loads(tts._connection_options()[2])["config"]["pronunciation"] == {
+        "name": "after"
+    }
+    assert spare.state is State.CLOSED and tts._websocket is active
+    await tts.cleanup()
