@@ -79,6 +79,9 @@ class _WireTurn:
     context_id: str
     socket: Any
     input_finished: bool = False
+    text: list[str] = field(default_factory=list)
+    has_audio: bool = False
+    retried: bool = False
 
 
 def _build_tts_config(
@@ -222,6 +225,9 @@ class SlngTTSService(WebsocketTTSService):
         # Socket we replaced ourselves, so the receive loop keeps going on the
         # replacement instead of treating the close as a failure.
         self._retiring: Any = None
+        self._connect_lock = asyncio.Lock()
+        self._session_dies_per_utterance = False
+        self._pending_resend: _WireTurn | None = None
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
@@ -283,7 +289,10 @@ class SlngTTSService(WebsocketTTSService):
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
-        await self._disconnect_websocket()
+        async with self._connect_lock:
+            await self._close_retiring_socket()
+            self._retiring = None
+            await self._disconnect_websocket()
 
     async def _keepalive_task_handler(self):
         """Send a ``keepalive`` control frame while the socket is idle.
@@ -309,7 +318,7 @@ class SlngTTSService(WebsocketTTSService):
     # Wire ownership: which synthesis context owns the next output on a socket
     #
 
-    def _reserve_wire_turn(self, context_id: str):
+    def _reserve_wire_turn(self, context_id: str) -> _WireTurn:
         """Claim the output this turn's text will produce, before sending it.
 
         Reserved before the send is awaited, because the bridge's first audio
@@ -317,12 +326,11 @@ class SlngTTSService(WebsocketTTSService):
         the entry, matching pipecat's default one-context-per-turn grouping.
         """
         ws = self._websocket
-        if any(
-            t.context_id == context_id and t.socket is ws and not t.input_finished
-            for t in self._wire
-        ):
-            return
-        self._wire.append(_WireTurn(context_id=context_id, socket=ws))
+        turn = self._find_wire_turn(context_id)
+        if turn is None or turn.input_finished:
+            turn = _WireTurn(context_id=context_id, socket=ws)
+            self._wire.append(turn)
+        return turn
 
     def _wire_head(self, ws: Any) -> _WireTurn | None:
         """The turn that owns the next output arriving on ``ws``."""
@@ -349,35 +357,40 @@ class SlngTTSService(WebsocketTTSService):
         )
         await self.remove_audio_context(turn.context_id)
 
-    async def _retire_stream(self, reason: str):
-        """Replace the socket because its remaining output can't be trusted.
+    async def _retire_stream(self, reason: str, replay: _WireTurn | None = None):
+        """Invalidate anonymous output before replacing a failed/abandoned stream.
 
-        `cleared` is not a portable drain barrier across the bridge's runtimes,
-        so audio already queued for an abandoned turn can still arrive. Dropping
-        the receive stream is the only isolation available on this side. Work
-        submitted on it is abandoned and reported through pipecat's existing
-        context handling — never replayed onto the replacement.
-
-        The replacement is opened first so the receive loop always finds a live
-        socket when the old one ends.
+        Only a single unvoiced turn may be retried after a server error. An
+        interruption, timeout, or ambiguous multi-turn failure is never replayed.
+        Close the old transport before awaiting a replacement handshake, retaining
+        its reference until closure so cancellation cannot orphan it.
         """
-        old = self._websocket
-        if old is None or self._disconnecting:
-            return
-        logger.debug(f"{self}: retiring TTS stream ({reason})")
-        self._wire.clear()
-        self._retiring = old
-        self._websocket = None
-        try:
-            await self._connect_websocket()
-        except Exception:
-            # Already reported by _connect_websocket; the next utterance retries.
-            pass
-        try:
+        async with self._connect_lock:
+            old = self._websocket
+            if old is None or self._disconnecting:
+                return
+            logger.debug(f"{self}: retiring TTS stream ({reason})")
+            abandoned = [t for t in self._wire if t is not replay]
+            self._wire.clear()
+            self._pending_resend = replay
+            self._retiring = old
+            self._websocket = None
+            self._ready_event.clear()
+            self._expect_server_close = False
+            self._expect_server_close_reason = None
+            for turn in abandoned:
+                await self.push_error(
+                    error_msg=f"SLNG TTS context {turn.context_id} abandoned: {reason}"
+                )
+                await self.remove_audio_context(turn.context_id)
+            await self._close_retiring_socket()
+            if not self._disconnecting:
+                await self._connect_websocket_locked()
+
+    async def _close_retiring_socket(self):
+        old = self._retiring
+        if old is not None and old.state is not State.CLOSED:
             await asyncio.wait_for(old.close(), timeout=WS_CLOSE_TIMEOUT)
-        except Exception as e:
-            logger.debug(f"{self}: retired stream did not close cleanly: {e}")
-        await self._call_event_handler("on_disconnected")
 
     def _build_config(self) -> dict[str, Any]:
         """Build the inner ``config`` object of the init message.
@@ -395,6 +408,12 @@ class SlngTTSService(WebsocketTTSService):
         with an error and ignores subsequent messages. The server responds with
         a ``ready`` message once the session is established.
         """
+        async with self._connect_lock:
+            await self._connect_websocket_locked()
+
+    async def _connect_websocket_locked(self):
+        if self._disconnecting:
+            return
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
@@ -428,8 +447,12 @@ class SlngTTSService(WebsocketTTSService):
             await self._websocket.send(json.dumps(init_msg))
 
             await self._call_event_handler("on_connected")
-        except Exception as e:
-            self._websocket = None
+        except BaseException as e:
+            ws, self._websocket = self._websocket, None
+            if ws is not None:
+                await ws.close()
+            if not isinstance(e, Exception):
+                raise
             # Community-integration guide (V4): push_error AND raise so the
             # PipelineRunner surfaces the failure instead of dribbling silent
             # send-after-disconnect errors.
@@ -445,7 +468,11 @@ class SlngTTSService(WebsocketTTSService):
         try:
             if ws and ws.state is State.OPEN:
                 logger.debug("Disconnecting from SLNG TTS")
-                await ws.send(json.dumps({"type": "close"}))
+                try:
+                    await ws.send(json.dumps({"type": "close"}))
+                finally:
+                    await ws.close()
+            elif ws is not None and ws.state is not State.CLOSED:
                 await ws.close()
         except Exception as e:
             await self.push_error(
@@ -456,6 +483,7 @@ class SlngTTSService(WebsocketTTSService):
             # outstanding on the wire. Their callers see pipecat's existing
             # zero-audio/context outcome; no text is replayed.
             self._wire.clear()
+            self._pending_resend = None
             await self.stop_all_metrics()
             await self.remove_active_audio_context()
             if self._websocket is ws:
@@ -487,9 +515,12 @@ class SlngTTSService(WebsocketTTSService):
         Unexpected closes (flag unset) keep the full base class behavior.
         """
         if self._retiring is not None:
-            retired, self._retiring = self._retiring, None
-            if self._websocket is not None and self._websocket is not retired:
-                return True  # receive loop re-reads the replacement socket
+            async with self._connect_lock:
+                await self._close_retiring_socket()
+                self._retiring = None
+                await self._call_event_handler("on_disconnected")
+                await self._connect_websocket_locked()
+            return not self._disconnecting and self._websocket is not None
 
         if self._expect_server_close and not self._disconnecting:
             self._expect_server_close = False
@@ -504,12 +535,50 @@ class SlngTTSService(WebsocketTTSService):
             return True  # receive loop continues on the new socket
         return await super()._maybe_try_reconnect(error_message, report_error, error)
 
+    async def on_turn_context_created(self, context_id: str):
+        """Rebuild a spent session as the next turn begins, once one has died.
+
+        Gated on a session having actually failed earlier in this call
+        (``_session_dies_per_utterance``). Routes that keep one session for a
+        whole call — cartesia, deepgram — never trip that, so they keep the
+        single session they have always had; rebuilding them anyway cost a
+        measured ~440 ms of time-to-first-audio per turn for nothing.
+
+        Called when the LLM starts a response (or a ``TTSSpeakFrame`` arrives),
+        which is before text reaches ``run_tts`` but only shortly before — so
+        the handshake overlaps sentence aggregation instead of sitting idle
+        through the user's turn. Routes whose stream ends per utterance
+        (``soniox/tts-rt:v1``) need a fresh session here; the alternative,
+        rebuilding when the previous turn ended, trips the bridge's idle
+        timeout every turn.
+
+        Args:
+            context_id: The newly created turn context ID.
+        """
+        if (
+            self._session_dies_per_utterance
+            and self._expect_server_close
+            and not self._wire
+            and self._pending_resend is None
+            and not self._disconnecting
+        ):
+            armed_by = self._expect_server_close_reason
+            self._expect_server_close = False
+            self._expect_server_close_reason = None
+            logger.debug(
+                f"{self}: session spent (armed by {armed_by}), "
+                f"rebuilding for the next turn"
+            )
+            await self._retire_stream("spent session at turn start")
+        await super().on_turn_context_created(context_id)
+
     async def on_audio_context_interrupted(self, context_id: str):
         """Send a ``Clear`` message to the server when the bot is interrupted.
 
         Args:
             context_id: The ID of the interrupted audio context.
         """
+        self._pending_resend = None
         await self.stop_all_metrics()
         if self._websocket and self._websocket.state is State.OPEN:
             try:
@@ -521,6 +590,9 @@ class SlngTTSService(WebsocketTTSService):
             # per-context loop that calls this only ever retires once.
             if self._wire_head(self._websocket):
                 await self._retire_stream("interrupted mid-utterance")
+            elif self._session_dies_per_utterance:
+                self._expect_server_close = True
+                self._expect_server_close_reason = "interrupted"
         await super().on_audio_context_interrupted(context_id)
 
     async def on_audio_context_completed(self, context_id: str):
@@ -536,6 +608,8 @@ class SlngTTSService(WebsocketTTSService):
         Args:
             context_id: The ID of the audio context that finished processing.
         """
+        if self._pending_resend and self._pending_resend.context_id == context_id:
+            self._pending_resend = None
         if any(t.context_id == context_id for t in self._wire):
             await self._retire_stream(f"no terminal for context {context_id}")
         await super().on_audio_context_completed(context_id)
@@ -552,9 +626,15 @@ class SlngTTSService(WebsocketTTSService):
             context_id: The specific context to flush. If None, falls back to
                 the currently active context.
         """
+        pending = self._pending_resend
+        if pending is not None and context_id in (None, pending.context_id):
+            pending.input_finished = True
+            return  # the replacement's ready handler sends this flush after replay
         if not self._websocket or self._websocket.state is not State.OPEN:
             return
         turn = self._find_wire_turn(context_id)
+        if context_id is not None and turn is None:
+            return  # a stale explicit flush must not terminate the next turn
         if turn is not None:
             if turn.input_finished:
                 return  # already terminated; a second flush would end the next turn
@@ -614,6 +694,8 @@ class SlngTTSService(WebsocketTTSService):
         if turn is None:
             logger.debug(f"{self}: dropping {len(audio)} audio bytes with no wire turn")
             return
+        turn.has_audio = True
+        turn.text.clear()
         frame = TTSAudioRawFrame(
             audio=audio,
             sample_rate=self.sample_rate,
@@ -630,12 +712,28 @@ class SlngTTSService(WebsocketTTSService):
             data: Decoded JSON payload from the server.
             ws: The socket the message arrived on. Defaults to the current one.
         """
+        if ws is not None and ws is not self._websocket:
+            return
         msg_type = data.get("type") or ""
         type_lc = msg_type.lower() if isinstance(msg_type, str) else ""
 
         if type_lc == "ready":
             session_id = data.get("session_id", "")
             logger.debug(f"{self}: SLNG TTS session ready (id={session_id})")
+            turn = self._pending_resend
+            if turn is not None and self._websocket is not None:
+                turn.socket = self._websocket
+                turn.retried = True
+                self._wire.insert(0, turn)
+                for text in turn.text:
+                    await turn.socket.send(json.dumps({"type": "text", "text": text}))
+                if turn.socket is not self._websocket:
+                    return
+                if turn.input_finished:
+                    await turn.socket.send(json.dumps({"type": "flush"}))
+                if turn.socket is not self._websocket:
+                    return
+                self._pending_resend = None
             self._ready_event.set()
 
         elif type_lc == "metadata":
@@ -669,6 +767,20 @@ class SlngTTSService(WebsocketTTSService):
             logger.error(f"{self}: SLNG TTS error: {error_msg}")
             await self.push_error(error_msg=str(error_msg))
             await self.stop_all_metrics()
+            if self._ready_event.is_set() and not self._disconnecting:
+                self._session_dies_per_utterance = True
+                # Preserve main's retry-before-audio behavior only when ownership
+                # is unambiguous. Never replay a voiced turn or loop on errors.
+                turn = self._wire_head(self._websocket)
+                replay = (
+                    turn
+                    if len(self._wire) == 1
+                    and turn is not None
+                    and not turn.has_audio
+                    and not turn.retried
+                    else None
+                )
+                await self._retire_stream("server error", replay)
 
         else:
             logger.debug(f"{self}: unknown message: {data}")
@@ -717,7 +829,9 @@ class SlngTTSService(WebsocketTTSService):
                 # later real failure (V15).
                 self._expect_server_close = False
                 self._expect_server_close_reason = None
-                self._reserve_wire_turn(context_id)
+                turn = self._reserve_wire_turn(context_id)
+                if not turn.has_audio:
+                    turn.text.append(text)
                 await self._websocket.send(json.dumps({"type": "text", "text": text}))
                 await self.start_tts_usage_metrics(text)
             except Exception as e:

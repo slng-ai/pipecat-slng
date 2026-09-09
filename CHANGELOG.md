@@ -7,55 +7,29 @@ to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Streaming TTS now completes an utterance on `audio_end`, not only on
-  `flushed`.** On routes that end a turn with `audio_end` alone — the Deepgram
-  and Gradium bridges both canonicalise their provider's completion to it, and
-  Sarvam sends it too — `SlngTTSService` delivered the audio but never a
-  `TTSStoppedFrame`. Nothing downstream was told the turn had finished, and
-  because this service runs with `push_stop_frames=False` the 3-second context
-  inactivity fallback could not supply one either: the stop simply never
-  arrived. Both terminal forms now complete the turn, and either one alone is
-  enough — a repeat, or the other form arriving as well, adds nothing.
+- Streaming TTS attributes audio and `audio_end`/`flushed` completion to submitted
+  turns on each socket, preserving later utterances when synthesis runs ahead of
+  playback. Duplicate terminals without another eligible owner complete only once;
+  segment terminals before the input flush do not end the utterance. Anonymous late
+  duplicates after another eligible turn remain a protocol limitation.
+- Preserve recovery for sessions that die between utterances: healthy routes reuse
+  their connection, while a route that has failed rebuilds at the next turn start
+  once its prior synthesis finishes. A server error can retry one unvoiced turn
+  once, retaining all submitted fragments and its flush. Voiced turns, multiple
+  outstanding turns, interruptions, and ambiguous send failures are not replayed.
+- Interruptions and abandoned synthesis retire the old transport before connecting
+  its replacement. Failed ownership and old-socket control messages cannot affect
+  the next stream; stale explicit flushes cannot terminate another turn. Teardown
+  closes retiring connections as well as the current one.
+- Reject `reuse_context_id_within_turn=False` before connecting because the bridge's
+  anonymous stream cannot attribute audio to separate fragment contexts.
 
-  Completion is also attributed correctly now. It used to follow
-  `get_active_audio_context_id()`, which reports pipecat's *playback* cursor and
-  lags synthesis by a whole utterance. With two turns in flight, the second
-  one's audio was appended behind the first context's end marker and never
-  played. Audio and completion are now routed by the order text was submitted on
-  the connection, tracked per socket.
+### Tests
 
-  Consumer-visible boundaries of the fix:
-
-  - Completion means synthesis output finished, not that the caller has heard
-    the buffered audio. Frame ordering is unchanged.
-  - A normally completed utterance leaves the connection open and reusable. An
-    actual server close after the terminal keeps the existing quiet per-utterance
-    reconnect.
-  - Interrupting or abandoning a turn whose output is still in flight now
-    replaces the connection. `cleared` is not a portable drain barrier across
-    the bridge's runtimes, so dropping the receive stream is the only way to
-    keep the provider's already-queued audio out of the next utterance. Other
-    turns submitted on that connection fail visibly; no text is ever resent.
-  - `reuse_context_id_within_turn=False` is now rejected in the constructor,
-    before any connection is opened. The bridge returns one unlabelled audio
-    stream per input turn, so per-fragment contexts have nothing to attribute it
-    to. Pipecat's default (`True`) is the supported configuration and is
-    unchanged.
-  - A turn that ends with no terminal message still has no completion
-    fabricated for it; the existing timeout and error behavior is untouched, as
-    are aggregation, pausing, language, timing, and keepalive defaults.
-
-  Known protocol limit: both terminal schemas are anonymous, so a late duplicate
-  for one turn arriving after the next turn is already eligible cannot be told
-  apart from the next turn's own terminal. Attributable repeats and traffic from
-  a retired connection are handled; that case is not, and no local heuristic can
-  close it.
-
-  Verified against pipecat-ai 1.8.0 with a parameterized regression covering
-  both terminal forms, duplicates, fragments and segment markers, pipelined
-  turns, connection reuse, interruption, zero audio, a missing terminal, and the
-  rejected configuration. No first-audio latency improvement is claimed or
-  measured here.
+- Add completion, pipelined-turn, recovery, and interruption regression coverage,
+  plus opt-in Sarvam TTS/STT speech checks and repeated latency measurements.
+  Measurement qualification remains under review; no latency improvement or warm
+  standby benefit is claimed. No gateway, STT runtime, or HTTP TTS changes.
 
 ## [0.5.1] - 2026-08-27
 
