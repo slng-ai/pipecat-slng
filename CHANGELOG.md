@@ -5,6 +5,8 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-01
+
 ### Added
 
 - `world_part` argument on `SlngSTTService` and `SlngTTSService`, plus the `WorldPart` enum. It picks the SLNG regional
