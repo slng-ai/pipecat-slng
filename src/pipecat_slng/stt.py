@@ -48,11 +48,11 @@ class SlngSTTSettings(STTSettings):
 
     Parameters:
         language: Language for speech recognition.
-        enable_vad: Whether to enable server-side VAD.
         enable_partials: Whether to receive partial (interim) transcriptions.
+            Honoured only by models that declare it (Deepgram Nova,
+            Soniox, Speechmatics, Reson8); other models ignore it.
     """
 
-    enable_vad: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_partials: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
@@ -64,7 +64,7 @@ class SlngSTTService(WebsocketSTTService):
 
     - Audio is sent as raw binary WebSocket frames (no JSON wrapping).
     - Connection-level config (``sample_rate``, ``encoding``, ``language``,
-      ``enable_partials``, ``enable_vad``) is sent in an ``init`` text message.
+      ``enable_partials``) is sent in an ``init`` text message.
     - Client control messages use lowercase ``type``: ``keepalive``,
       ``finalize``, ``close``.
     - Server emits ``ready``, ``partial_transcript``, ``final_transcript``,
@@ -86,7 +86,6 @@ class SlngSTTService(WebsocketSTTService):
         world_part_override: str | None = None,
         provider_key: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
-        enable_vad: bool | NotGiven = NOT_GIVEN,
         enable_partials: bool | NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
         **kwargs,
@@ -110,18 +109,23 @@ class SlngSTTService(WebsocketSTTService):
                 key surfaces as a ``backend_connection_failed`` error frame with
                 the upstream 401/403 detail. See
                 https://docs.slng.ai/execution-layer/byok.
-            language: Recognition language. Defaults to ``Language.EN`` when not given.
-            enable_vad: Enable server-side VAD. Defaults to ``True`` when not given.
+            language: Recognition language. When not given, none is sent and the
+                gateway applies the selected model's default language, defined
+                per model in the SLNG catalog: e.g. ``hi`` on
+                ``slng/deepgram/nova:3-hi``, ``en`` on Soniox, ``hi-IN`` on
+                Amazon Transcribe. Pass it only to override that default.
             enable_partials: Stream partial (interim) transcripts. Defaults to
-                ``True`` when not given.
+                ``True`` when not given. Honoured only by models that declare it
+                (Deepgram Nova, Soniox, Speechmatics, Reson8); other models,
+                such as Sarvam Saaras, ignore it.
             settings: Runtime-updatable settings override. Merged on top of any
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketSTTService.
         """
         default_settings = self.Settings(
             model=model,
-            language=language if is_given(language) else Language.EN,
-            enable_vad=enable_vad if is_given(enable_vad) else True,
+            # None, not NOT_GIVEN: Pipecat's store-mode settings reject NOT_GIVEN.
+            language=language if is_given(language) else None,
             enable_partials=enable_partials if is_given(enable_partials) else True,
         )
 
@@ -283,9 +287,6 @@ class SlngSTTService(WebsocketSTTService):
 
         if is_given(self._settings.language) and self._settings.language is not None:
             config["language"] = str(self._settings.language)
-
-        if is_given(self._settings.enable_vad):
-            config["enable_vad"] = bool(self._settings.enable_vad)
 
         if is_given(self._settings.enable_partials):
             config["enable_partials"] = bool(self._settings.enable_partials)
