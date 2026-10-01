@@ -5,7 +5,32 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `world_part` argument on `SlngSTTService` and `SlngTTSService`, plus the `WorldPart` enum. It picks the SLNG regional
+  gateway: requests go to `{world_part}.api.slng.ai`. Valid values are
+  `eu-north`, `eu-west`, `us-east`, `us-west`, `au`, `br`, `gb`, `id`, `il`,
+  `in`, `jp`, `sg`, `za`.
+
 ### Removed
+
+- **Breaking:** the global `api.slng.ai` gateway is no longer used. Every
+  service now requires `world_part`. Calls without it raise `TypeError`.
+- **Breaking:** `region_override` and `world_part_override` are removed from
+  both services, together with the `X-Region-Override` /
+  `X-World-Part-Override` headers and the HTTP `region` / `world-part` query
+  parameters. Pass `world_part` instead.
+- **Breaking:** `SlngHttpTTSService` is removed. The regional gateways do not
+  serve the HTTP bridge (`POST .../v1/bridges/unmute/tts/{model}` returns 405).
+  Use the streaming `SlngTTSService`. The direct `aiohttp` dependency is
+  dropped with it.
+
+### Deprecated
+
+- `base_url` is deprecated. It is accepted only when its host matches
+  `world_part` (for example `base_url="in.api.slng.ai"` with
+  `world_part="in"`), and it logs a `DeprecationWarning`. Any other host,
+  including `api.slng.ai`, raises `ValueError`.
 
 - **Breaking:** `SlngSTTService(enable_vad=...)` and `SlngSTTSettings.enable_vad`
   are removed. No model on the SLNG Unmute STT bridge implements `enable_vad`;

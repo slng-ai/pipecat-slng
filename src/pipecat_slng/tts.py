@@ -7,15 +7,11 @@
 """SLNG text-to-speech service."""
 
 import asyncio
-import io
 import json
-import wave
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
 
-import aiohttp
 from loguru import logger
 
 from pipecat.frames.frames import (
@@ -28,7 +24,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.services.settings import NOT_GIVEN, TTSSettings, NotGiven, is_given
-from pipecat.services.tts_service import TTSService, WebsocketTTSService
+from pipecat.services.tts_service import WebsocketTTSService
 from pipecat.services.websocket_service import WS_CLOSE_TIMEOUT
 from pipecat.transcriptions.language import Language
 from pipecat.utils.tracing.service_decorators import traced_tts
@@ -37,6 +33,7 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat_slng._errors import connect_error_detail
+from pipecat_slng._gateway import WorldPart
 
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
@@ -89,8 +86,7 @@ def _build_tts_config(
 ) -> dict[str, Any]:
     """Build the SLNG TTS bridge ``config`` object.
 
-    Shared by the WebSocket and HTTP TTS services so the wire format stays in
-    one place. ``encoding``/``sample_rate`` are always included; ``language``
+    ``encoding``/``sample_rate`` are always included; ``language``
     and ``speed`` only when given and not None.
     """
     config: dict[str, Any] = {"encoding": encoding, "sample_rate": sample_rate}
@@ -107,7 +103,7 @@ class SlngTTSService(WebsocketTTSService):
     """Text-to-speech service using the SLNG Unmute TTS bridge WebSocket API.
 
     Provides real-time speech synthesis through a persistent WebSocket
-    connection to ``wss://api.slng.ai/v1/bridges/unmute/tts/{model}``:
+    connection to ``wss://{world_part}.api.slng.ai/v1/bridges/unmute/tts/{model}``:
 
     - Connection-level config (``voice``, ``encoding``, ``sample_rate``,
       ``speed``, ``language``) is sent in an ``init`` text message.
@@ -126,13 +122,12 @@ class SlngTTSService(WebsocketTTSService):
         self,
         *,
         api_key: str,
+        world_part: WorldPart | str,
         model: str = _DEFAULT_TTS_MODEL,
         voice: str | None = None,
-        base_url: str = "api.slng.ai",
+        base_url: str | None = None,
         encoding: str = "linear16",
         sample_rate: int | None = None,
-        region_override: str | None = None,
-        world_part_override: str | None = None,
         provider_key: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
@@ -145,18 +140,15 @@ class SlngTTSService(WebsocketTTSService):
 
         Args:
             api_key: Authentication key for the SLNG API.
+            world_part: The SLNG region to call, e.g. ``"in"`` or ``"us-west"``.
+                Requests go to ``{world_part}.api.slng.ai``. See ``WorldPart``.
             model: The TTS model to use. Defaults to "slng/deepgram/aura:2-en".
             voice: Voice identifier for synthesis (e.g. "aura-2-thalia-en").
-            base_url: The API host. Defaults to "api.slng.ai".
+            base_url: Deprecated. A regional host such as ``"in.api.slng.ai"``.
+                It must match ``world_part``. Pass ``world_part`` only instead.
             encoding: Audio encoding format. One of ``"linear16"``, ``"mp3"``,
                 ``"opus"``, ``"mulaw"``, or ``"alaw"``. Defaults to ``"linear16"``.
             sample_rate: Audio sample rate in Hz. If None, uses the pipeline sample rate.
-            region_override: Pin requests to a specific datacenter. One of
-                ``"ap-southeast-2"``, ``"eu-north-1"``, ``"us-east-1"``. Sets the
-                ``X-Region-Override`` header (takes precedence over ``world_part_override``).
-            world_part_override: Constrain routing to a broad geographic zone.
-                One of ``"ap"``, ``"eu"``, ``"na"``. Sets the ``X-World-Part-Override``
-                header.
             provider_key: Your own upstream provider API key (BYOK). Sent as the
                 ``X-Slng-Provider-Key`` header on the WebSocket upgrade, so the
                 provider bills your account directly. Only supported on external
@@ -177,6 +169,9 @@ class SlngTTSService(WebsocketTTSService):
                 explicit kwargs above.
             **kwargs: Additional arguments passed to parent WebsocketTTSService.
         """
+        # Fail fast, before the parent service is built.
+        resolved_world_part = WorldPart.resolve(world_part, base_url)
+
         default_settings = self.Settings(
             model=model,
             voice=voice,
@@ -209,10 +204,8 @@ class SlngTTSService(WebsocketTTSService):
             )
 
         self._api_key = api_key
-        self._base_url = base_url
+        self._world_part = resolved_world_part
         self._encoding = encoding
-        self._region_override = region_override
-        self._world_part_override = world_part_override
         self._provider_key = provider_key
         self._receive_task = None
         self._keepalive_task = None
@@ -254,14 +247,8 @@ class SlngTTSService(WebsocketTTSService):
         model = self._settings.model
         if not is_given(model) or not model:
             model = _DEFAULT_TTS_MODEL
-        model_path = quote(model, safe="/:")
-        base = self._base_url if "://" in self._base_url else f"wss://{self._base_url}"
-        url = f"{base}/v1/bridges/unmute/tts/{model_path}"
+        url = self._world_part.bridge_url("tts", model)
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        if self._region_override:
-            headers["X-Region-Override"] = self._region_override
-        if self._world_part_override:
-            headers["X-World-Part-Override"] = self._world_part_override
         if self._provider_key:
             headers["X-Slng-Provider-Key"] = self._provider_key
         init = {"type": "init", "config": self._build_config()}
@@ -601,9 +588,9 @@ class SlngTTSService(WebsocketTTSService):
             await self._close_retiring_socket()
             self._retiring = None
             await self._disconnect_websocket()
-        for error in closing:
-            if isinstance(error, BaseException):
-                raise error
+        error = next((e for e in closing if isinstance(e, BaseException)), None)
+        if error is not None:
+            raise error
 
     async def _keepalive_task_handler(self):
         """Send a ``keepalive`` control frame while the socket is idle.
@@ -618,12 +605,13 @@ class SlngTTSService(WebsocketTTSService):
         """
         while True:
             await asyncio.sleep(_KEEPALIVE_INTERVAL)
-            sockets = [self._websocket]
-            if self._standby_ws is not None and self._standby_ready:
-                sockets.append(self._standby_ws)
+            standby = self._standby_ws if self._standby_ready else None
+            sockets = [
+                ws
+                for ws in (self._websocket, standby)
+                if ws is not None and ws.state is State.OPEN
+            ]
             for ws in sockets:
-                if ws is None or ws.state is not State.OPEN:
-                    continue
                 try:
                     await ws.send(json.dumps({"type": "keepalive"}))
                 except Exception as e:
@@ -1069,14 +1057,18 @@ class SlngTTSService(WebsocketTTSService):
         current socket — the non-concurrent caller contract.
         """
         ws = self._websocket
-        for turn in self._wire:
-            if turn.socket is not ws:
-                continue
-            if turn.context_id == context_id or (
-                context_id is None and not turn.input_finished
-            ):
-                return turn
-        return None
+        return next(
+            (
+                turn
+                for turn in self._wire
+                if turn.socket is ws
+                and (
+                    turn.context_id == context_id
+                    or (context_id is None and not turn.input_finished)
+                )
+            ),
+            None,
+        )
 
     async def _receive_messages(self):
         """Receive and dispatch incoming WebSocket messages.
@@ -1330,262 +1322,3 @@ class SlngTTSService(WebsocketTTSService):
         await self._disconnect()
         await self._connect()
         return changed
-
-
-def _extract_pcm(data: bytes, default_sample_rate: int) -> tuple[int, bytes | None]:
-    """Extract raw PCM and its sample rate from an HTTP TTS response body.
-
-    The SLNG HTTP bridge returns ``audio/*`` without documenting the codec, so
-    the format is detected from the bytes:
-
-    - A WAV/RIFF container is parsed to raw PCM at its embedded sample rate.
-    - Plain PCM (no recognised container or compressed magic) is returned as-is
-      at ``default_sample_rate``.
-    - Compressed formats (MP3/Ogg) return ``(default_sample_rate, None)`` so the
-      caller can surface an error — pipecat needs raw PCM, not an encoded codec.
-    """
-    if not data:
-        return default_sample_rate, b""
-    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
-        with wave.open(io.BytesIO(data), "rb") as wf:
-            return wf.getframerate(), wf.readframes(wf.getnframes())
-    if (
-        data[:3] == b"ID3"
-        or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")  # MP3 frame sync
-        or data[:4] == b"OggS"  # Ogg/Opus
-    ):
-        return default_sample_rate, None
-    return default_sample_rate, data
-
-
-class SlngHttpTTSService(TTSService):
-    """Text-to-speech service using the SLNG Unified TTS bridge HTTP API.
-
-    Performs non-streaming (request/response) synthesis via
-    ``POST https://api.slng.ai/v1/bridges/unmute/tts/{model}``. Each
-    ``run_tts`` call issues a single HTTP request and returns the full audio
-    body as one ``TTSAudioRawFrame``. Prefer the streaming WebSocket
-    :class:`SlngTTSService` for low-latency, interruptible conversational
-    audio; use this for simpler batch/non-streaming synthesis.
-
-    The bridge accepts only ``{text, voice}`` in the body and returns
-    ``audio/*`` without a documented codec, so responses are auto-detected: a
-    WAV/RIFF container is decoded to raw PCM at the file's sample rate, and
-    anything else is treated as raw PCM at the pipeline sample rate. Compressed
-    formats (MP3/Ogg) are rejected with an error.
-    """
-
-    Settings = SlngTTSSettings
-    _settings: Settings
-
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = _DEFAULT_TTS_MODEL,
-        voice: str | None = None,
-        base_url: str = "https://api.slng.ai",
-        aiohttp_session: aiohttp.ClientSession | None = None,
-        sample_rate: int | None = None,
-        region_override: str | None = None,
-        world_part_override: str | None = None,
-        provider_key: str | None = None,
-        language: Language | NotGiven = NOT_GIVEN,
-        speed: float | None | NotGiven = NOT_GIVEN,
-        settings: Settings | None = None,
-        **kwargs,
-    ):
-        """Initialize SlngHttpTTSService.
-
-        Args:
-            api_key: Authentication key for the SLNG API.
-            model: The TTS model to use. Defaults to "slng/deepgram/aura:2-en".
-            voice: Voice identifier for synthesis (e.g. "aura-2-thalia-en").
-            base_url: Full base URL (including scheme) of the SLNG API.
-                Defaults to "https://api.slng.ai".
-            aiohttp_session: Optional aiohttp ClientSession. If None, one is
-                created in ``start()`` and closed in ``stop()``/``cancel()``.
-            sample_rate: Audio sample rate in Hz. If None, uses the pipeline rate.
-                Applied to non-container (raw PCM) responses; WAV responses use
-                their own embedded sample rate.
-            region_override: Pin requests to a specific datacenter. Sent as the
-                ``region`` query parameter.
-            world_part_override: Constrain routing to a broad geographic zone.
-                Sent as the ``world-part`` query parameter.
-            provider_key: Your own upstream provider API key (BYOK). Sent as the
-                ``X-Slng-Provider-Key`` header on each request, so the provider
-                bills your account directly. Only supported on external catalog
-                routes (no ``slng/`` prefix), e.g. ``deepgram/aura:2``;
-                SLNG-hosted ``slng/...`` routes reject it with a 400. A rejected
-                key returns the upstream 401/403 with the
-                ``X-Slng-Auth-Source: client_key`` response header. See
-                https://docs.slng.ai/execution-layer/byok.
-            language: Kept for API parity with the WebSocket service; the SLNG
-                HTTP bridge body is ``{text, voice}`` only and does NOT accept
-                a ``config`` object, so this value is not sent over the wire.
-            speed: Kept for API parity with the WebSocket service; not sent over
-                the wire for the same reason as ``language``.
-            settings: Runtime-updatable settings override. Merged on top of any
-                explicit kwargs above.
-            **kwargs: Additional arguments passed to parent TTSService.
-        """
-        default_settings = self.Settings(
-            model=model,
-            voice=voice,
-            language=language if is_given(language) else Language.EN,
-            speed=speed if is_given(speed) else None,
-        )
-
-        if settings is not None:
-            default_settings.apply_update(settings)
-
-        super().__init__(
-            sample_rate=sample_rate,
-            push_start_frame=True,
-            push_stop_frames=True,
-            settings=default_settings,
-            **kwargs,
-        )
-
-        self._api_key = api_key
-        self._base_url = base_url
-        self._region_override = region_override
-        self._world_part_override = world_part_override
-        self._provider_key = provider_key
-        self._session = aiohttp_session
-        self._owns_session = aiohttp_session is None
-
-    def can_generate_metrics(self) -> bool:
-        """Check if the service can generate processing metrics.
-
-        Returns:
-            True, indicating metrics are supported.
-        """
-        return True
-
-    async def start(self, frame: StartFrame):
-        """Start the service, creating an HTTP session if none was provided.
-
-        Args:
-            frame: Frame indicating service should start.
-        """
-        await super().start(frame)
-        if self._owns_session and self._session is None:
-            self._session = aiohttp.ClientSession()
-
-    async def _close_session(self):
-        """Close the HTTP session if this service owns it."""
-        if self._owns_session and self._session is not None:
-            await self._session.close()
-            self._session = None
-
-    async def stop(self, frame: EndFrame):
-        """Stop the service and close an owned HTTP session.
-
-        Args:
-            frame: Frame indicating service should stop.
-        """
-        await super().stop(frame)
-        await self._close_session()
-
-    async def cancel(self, frame: CancelFrame):
-        """Cancel the service and close an owned HTTP session.
-
-        Args:
-            frame: Frame indicating service should be cancelled.
-        """
-        await super().cancel(frame)
-        await self._close_session()
-
-    @traced_tts
-    async def run_tts(
-        self, text: str, context_id: str
-    ) -> AsyncGenerator[Frame | None, None]:
-        """Generate speech from text via a single SLNG HTTP request.
-
-        Args:
-            text: The text to synthesise into speech.
-            context_id: The context ID for tracking audio frames.
-
-        Yields:
-            A single ``TTSAudioRawFrame`` with the synthesised audio, or an
-            ``ErrorFrame`` on failure. ``TTSStartedFrame``/``TTSStoppedFrame``
-            are emitted by the base class.
-        """
-        logger.debug(f"{self}: Generating HTTP TTS [{text}]")
-
-        try:
-            if self._session is None:
-                raise RuntimeError(
-                    "HTTP session is not initialized; call start() before run_tts()"
-                )
-
-            model = self._settings.model
-            if not is_given(model) or not model:
-                model = _DEFAULT_TTS_MODEL
-            model_path = quote(model, safe="/:")
-            url = f"{self._base_url}/v1/bridges/unmute/tts/{model_path}"
-
-            headers: dict[str, str] = {
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            }
-            if self._provider_key:
-                headers["X-Slng-Provider-Key"] = self._provider_key
-
-            # The HTTP bridge body accepts only {text, voice}; region/world-part
-            # are query parameters (the WebSocket service uses headers instead).
-            params: dict[str, str] = {}
-            if self._region_override:
-                params["region"] = self._region_override
-            if self._world_part_override:
-                params["world-part"] = self._world_part_override
-
-            payload: dict[str, Any] = {"text": text}
-            if self._settings.voice:
-                payload["voice"] = str(self._settings.voice)
-
-            async with self._session.post(
-                url, json=payload, headers=headers, params=params or None
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    error_msg = (
-                        f"SLNG HTTP TTS error (status {response.status}): {error_text}"
-                    )
-                    await self.push_error(error_msg=error_msg)
-                    yield ErrorFrame(error=error_msg)
-                    return
-                content_type = response.headers.get("Content-Type", "")
-                audio = await response.read()
-
-            sample_rate, pcm = _extract_pcm(audio, self.sample_rate)
-            if pcm is None:
-                logger.error(
-                    f"{self}: unsupported audio format from HTTP bridge "
-                    f"(content-type={content_type!r}, first bytes={audio[:4]!r})"
-                )
-                error_msg = (
-                    "SLNG HTTP TTS returned an unsupported audio format "
-                    f"(content-type={content_type!r}); expected raw PCM or WAV. "
-                    "Use the WebSocket SlngTTSService for streaming PCM."
-                )
-                await self.push_error(error_msg=error_msg)
-                yield ErrorFrame(error=error_msg)
-                return
-
-            await self.start_tts_usage_metrics(text)
-
-            yield TTSAudioRawFrame(
-                audio=pcm,
-                sample_rate=sample_rate,
-                num_channels=1,
-                context_id=context_id,
-            )
-
-        except Exception as e:
-            error_msg = f"Unknown error occurred: {e}"
-            await self.push_error(error_msg=error_msg, exception=e)
-            yield ErrorFrame(error=error_msg)
-        finally:
-            await self.stop_ttfb_metrics()

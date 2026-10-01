@@ -25,6 +25,7 @@ pip install pipecat-slng
 
 ```env
 SLNG_API_KEY=your_slng_api_key      # get one at https://slng.ai
+SLNG_WORLD_PART=us-east             # SLNG region, see "Regions" below
 OPENAI_API_KEY=your_openai_api_key  # only needed for the example bot (LLM)
 ```
 
@@ -43,11 +44,13 @@ from pipecat_slng import SlngSTTService, SlngTTSService
 
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="us-east",
     model="slng/deepgram/nova:3-en",
 )
 
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="us-east",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
 )
@@ -105,6 +108,7 @@ Enable one prepared connection for the next utterance:
 ```python
 tts = SlngTTSService(
     api_key=os.environ["SLNG_API_KEY"],
+    world_part="us-east",
     model="gradium/tts:default",
     voice="QETTJoT4n_WmpL3w",
     warm_standby_enabled=True,  # default: False
@@ -155,6 +159,7 @@ applies the rewrite rules.
 ```python
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="us-east",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
     pronunciation={"mode": "rewrite", "name": "support-pronunciations"},
@@ -164,51 +169,58 @@ tts = SlngTTSService(
 Use `{"mode": "rewrite", "dictionary_id": "pd_..."}` to reference an
 immutable dictionary version. See the [pronunciation dictionary docs](https://docs.slng.ai/pronunciation-dictionaries).
 
-## HTTP TTS (non-streaming fallback)
+## Regions
 
-For simple request/response synthesis where streaming is not required, use
-`SlngHttpTTSService`. It issues one HTTP POST per utterance and returns the
-full audio body in one frame.
+Every service needs a `world_part`. It picks the SLNG region that handles the
+request. Each region has its own gateway at `{world_part}.api.slng.ai`.
+Requests are not routed between regions.
 
 ```python
-import os
-
-from pipecat_slng import SlngHttpTTSService
-
-tts = SlngHttpTTSService(
+tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
-    model="slng/deepgram/aura:2-en",
-    voice="aura-2-thalia-en",
+    world_part="in",  # or WorldPart.IN
+    model="sarvam/bulbul:v3",
+    voice="shubh",
 )
 ```
 
-**HTTP contract limits.** Per the SLNG Unified TTS HTTP OpenAPI, the request
-body accepts **only `{text, voice}`** — there is no `config` object. Encoding,
-sample_rate, language, and speed are therefore **not configurable over HTTP**;
-the server returns its default audio format. The service auto-detects WAV
-(decoded to raw PCM at the file's sample rate) and plain PCM (passed through
-at the pipeline's sample rate). Compressed responses (MP3/Ogg) yield an
-`ErrorFrame` — use the streaming `SlngTTSService` if you need codec control.
+| Region | `world_part` |
+| - | - |
+| Netherlands | `eu-north` |
+| Germany | `eu-west` |
+| United States (East) | `us-east` |
+| United States (West) | `us-west` |
+| Australia | `au` |
+| Brazil | `br` |
+| United Kingdom | `gb` |
+| Indonesia | `id` |
+| Israel | `il` |
+| India | `in` |
+| Japan | `jp` |
+| Singapore | `sg` |
+| South Africa | `za` |
 
-An `aiohttp.ClientSession` is created internally if you don't pass one; supply
-`aiohttp_session=...` to reuse a shared session.
+Models differ by region. Check
+[models by region](https://docs.slng.ai/models/catalog/by-region) before you
+pick one. The default `slng/deepgram/...` models run in `us-east`.
 
-## Region routing
+### Moving from `base_url`
 
-Both services support gateway region routing via `region_override` (pin to a
-datacenter: `ap-southeast-2` | `eu-north-1` | `us-east-1`) and
-`world_part_override` (broad zone: `ap` | `eu` | `na`). When both are set,
-`region_override` wins. WebSocket services send these as the
-`X-Region-Override` / `X-World-Part-Override` headers; the HTTP service uses
-the `region` / `world-part` query parameters (per the bridge contract).
+`base_url` is deprecated. It still works if its host matches `world_part`, and
+it logs a `DeprecationWarning`:
 
 ```python
-stt = SlngSTTService(
-    api_key=os.getenv("SLNG_API_KEY"),
-    model="slng/deepgram/nova:3-en",
-    region_override="eu-north-1",
-)
+# Works, with a warning. Remove base_url.
+SlngSTTService(api_key=key, world_part="in", base_url="in.api.slng.ai")
+
+# ValueError: the global api.slng.ai gateway is no longer supported.
+SlngSTTService(api_key=key, world_part="in", base_url="api.slng.ai")
+
+# ValueError: the host does not match world_part.
+SlngSTTService(api_key=key, world_part="us-west", base_url="in.api.slng.ai")
 ```
+
+`region_override` and `world_part_override` are removed. Use `world_part`.
 
 ## Model routing & bring-your-own-key (BYOK)
 
@@ -240,12 +252,14 @@ See the [BYOK docs](https://docs.slng.ai/execution-layer/byok).
 # same pattern works for any external provider (ElevenLabs, Cartesia, Sarvam, …).
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),            # authenticates you to SLNG
+    world_part="us-east",
     model="deepgram/nova:3",                      # external route — no slng/ prefix
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),  # your own provider key
 )
 
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
+    world_part="us-east",
     model="deepgram/aura:2",                      # external route — no slng/ prefix
     voice="aura-2-thalia-en",
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),
@@ -255,8 +269,7 @@ tts = SlngTTSService(
 BYOK is valid only on **external** routes; an `slng/...` route plus a
 `provider_key` is rejected with a 400 (*"BYOK is only supported for external
 STT/TTS routes"*). If the provider rejects your key, the failure surfaces as a
-`backend_connection_failed` error frame over WebSocket, or the upstream 401/403
-with the `X-Slng-Auth-Source: client_key` response header over HTTP.
+`backend_connection_failed` error frame with the upstream 401/403 detail.
 
 ## Example
 
@@ -269,6 +282,7 @@ uv run --extra example examples/bot.py
 ```
 
 Then open http://localhost:7860/client in your browser and start talking.
+Pick the region with `SLNG_WORLD_PART` (default `us-east`).
 Pick models with `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` (both default to `slng/...`
 self-hosted routes); set `SLNG_PROVIDER_KEY` to your own provider key to run an
 external route in BYOK mode. The bot uses the SmallWebRTC transport by default;
