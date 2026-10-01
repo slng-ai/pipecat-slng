@@ -57,7 +57,8 @@ Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
 `enable_partials=`). For richer overrides pass a
 `SlngSTTSettings(...)` / `SlngTTSSettings(...)` to `settings=`.
 
-Defaults when not specified: STT uses `language=Language.EN` and
+Defaults when not specified: STT sends no `language`, so the route's own
+default applies (e.g. `hi` on `slng/deepgram/nova:3-hi`), and uses
 `enable_partials=True`; TTS uses `language=Language.EN` and the server's
 default `speed`.
 

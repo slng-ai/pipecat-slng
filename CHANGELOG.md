@@ -16,6 +16,14 @@ to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `SlngSTTService` no longer defaults `language` to `Language.EN`. When the
+  caller does not pass `language`, the init `config` omits it and the route's
+  own default applies. Previously every STT session without an explicit
+  language sent `en`, including to language-specific routes such as
+  `slng/deepgram/nova:3-hi`, where the gateway forwards it to the provider
+  (or closes the session on strict routes). Callers who relied on the implicit
+  English default on a multilingual route should pass `language=Language.EN`.
+  Verified with Pipecat 1.8.0.
 - Document that `enable_partials` (still `True` by default) is honoured only by
   models that declare it (Deepgram Nova, Soniox, Speechmatics, Reson8); other
   models, such as Sarvam Saaras, ignore it. Wire behaviour is unchanged.

@@ -109,7 +109,9 @@ class SlngSTTService(WebsocketSTTService):
                 key surfaces as a ``backend_connection_failed`` error frame with
                 the upstream 401/403 detail. See
                 https://docs.slng.ai/execution-layer/byok.
-            language: Recognition language. Defaults to ``Language.EN`` when not given.
+            language: Recognition language. When not given, none is sent and the
+                route's own default applies (e.g. ``hi`` on
+                ``slng/deepgram/nova:3-hi``).
             enable_partials: Stream partial (interim) transcripts. Defaults to
                 ``True`` when not given. Honoured only by models that declare it
                 (Deepgram Nova, Soniox, Speechmatics, Reson8); other models,
@@ -120,7 +122,7 @@ class SlngSTTService(WebsocketSTTService):
         """
         default_settings = self.Settings(
             model=model,
-            language=language if is_given(language) else Language.EN,
+            language=language,
             enable_partials=enable_partials if is_given(enable_partials) else True,
         )
 

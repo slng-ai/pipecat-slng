@@ -49,6 +49,8 @@ async def test_init_message_sent_on_start(patch_ws):
     assert init["config"]["encoding"] == "linear16"
     # No bridge model declares enable_vad; the gateway accepts and drops it.
     assert "enable_vad" not in init["config"]
+    # Unset language must not override the route's own (e.g. nova:3-hi).
+    assert "language" not in init["config"]
 
 
 async def test_auth_header_sent(patch_ws):
