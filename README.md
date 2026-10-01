@@ -57,10 +57,15 @@ Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
 `enable_partials=`). For richer overrides pass a
 `SlngSTTSettings(...)` / `SlngTTSSettings(...)` to `settings=`.
 
-Defaults when not specified: STT sends no `language`, so the route's own
-default applies (e.g. `hi` on `slng/deepgram/nova:3-hi`), and uses
+Defaults when not specified: STT sends no `language`, and uses
 `enable_partials=True`; TTS uses `language=Language.EN` and the server's
 default `speed`.
+
+When `language` is omitted, the gateway applies the selected model's default
+language, which the SLNG catalog defines per model: for example `hi` on
+`slng/deepgram/nova:3-hi`, `en` on Soniox, and `hi-IN` on Amazon Transcribe.
+On language-specific routes such as `nova:3-hi` the route already fixes the
+language, so pass `language=` only to override a model's default.
 
 `enable_partials` is honoured only by models that declare it (Deepgram Nova,
 Soniox, Speechmatics, Reson8). Other models, such as Sarvam Saaras, return

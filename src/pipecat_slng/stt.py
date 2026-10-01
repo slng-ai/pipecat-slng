@@ -110,8 +110,10 @@ class SlngSTTService(WebsocketSTTService):
                 the upstream 401/403 detail. See
                 https://docs.slng.ai/execution-layer/byok.
             language: Recognition language. When not given, none is sent and the
-                route's own default applies (e.g. ``hi`` on
-                ``slng/deepgram/nova:3-hi``).
+                gateway applies the selected model's default language, defined
+                per model in the SLNG catalog: e.g. ``hi`` on
+                ``slng/deepgram/nova:3-hi``, ``en`` on Soniox, ``hi-IN`` on
+                Amazon Transcribe. Pass it only to override that default.
             enable_partials: Stream partial (interim) transcripts. Defaults to
                 ``True`` when not given. Honoured only by models that declare it
                 (Deepgram Nova, Soniox, Speechmatics, Reson8); other models,
