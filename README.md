@@ -54,12 +54,16 @@ tts = SlngTTSService(
 ```
 
 Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
-`enable_vad=`, `enable_partials=`). For richer overrides pass a
+`enable_partials=`). For richer overrides pass a
 `SlngSTTSettings(...)` / `SlngTTSSettings(...)` to `settings=`.
 
-Defaults when not specified: STT uses `language=Language.EN`,
-`enable_vad=True`, `enable_partials=True`; TTS uses `language=Language.EN`
-and the server's default `speed`.
+Defaults when not specified: STT uses `language=Language.EN` and
+`enable_partials=True`; TTS uses `language=Language.EN` and the server's
+default `speed`.
+
+`enable_partials` is honoured only by models that declare it (Deepgram Nova,
+Soniox, Speechmatics, Reson8). Other models, such as Sarvam Saaras, return
+final transcripts only and ignore it.
 
 Three behaviors worth knowing:
 

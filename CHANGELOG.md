@@ -5,6 +5,21 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** `SlngSTTService(enable_vad=...)` and `SlngSTTSettings.enable_vad`
+  are removed. No model on the SLNG Unmute STT bridge implements `enable_vad`;
+  the gateway accepted and silently dropped it on every route, so it never
+  changed transcription. `SlngSTTService` no longer sends `enable_vad` in the
+  init `config`. Callers passing `enable_vad=` now get a `TypeError`: delete
+  the argument, as transcription is unaffected. Verified with Pipecat 1.8.0.
+
+### Changed
+
+- Document that `enable_partials` (still `True` by default) is honoured only by
+  models that declare it (Deepgram Nova, Soniox, Speechmatics, Reson8); other
+  models, such as Sarvam Saaras, ignore it. Wire behaviour is unchanged.
+
 ## [0.5.2] - 2026-09-09
 
 ### Added

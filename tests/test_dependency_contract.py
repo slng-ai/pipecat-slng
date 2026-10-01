@@ -87,7 +87,6 @@ def test_v27_lock_pins_the_declared_floor():
 @pytest.mark.parametrize(
     "settings_name, field",
     [
-        ("SlngSTTSettings", "enable_vad"),
         ("SlngSTTSettings", "enable_partials"),
         ("SlngTTSSettings", "speed"),
     ],

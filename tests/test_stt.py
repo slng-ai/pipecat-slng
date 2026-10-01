@@ -47,6 +47,8 @@ async def test_init_message_sent_on_start(patch_ws):
     init = next(m for m in text_sends if m.get("type") == "init")
     assert init["config"]["sample_rate"] == 16000
     assert init["config"]["encoding"] == "linear16"
+    # No bridge model declares enable_vad; the gateway accepts and drops it.
+    assert "enable_vad" not in init["config"]
 
 
 async def test_auth_header_sent(patch_ws):
