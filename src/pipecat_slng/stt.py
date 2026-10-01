@@ -122,7 +122,8 @@ class SlngSTTService(WebsocketSTTService):
         """
         default_settings = self.Settings(
             model=model,
-            language=language,
+            # None, not NOT_GIVEN: Pipecat's store-mode settings reject NOT_GIVEN.
+            language=language if is_given(language) else None,
             enable_partials=enable_partials if is_given(enable_partials) else True,
         )
 

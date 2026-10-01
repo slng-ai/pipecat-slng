@@ -35,13 +35,22 @@ def _audio():
 
 async def test_init_message_sent_on_start(patch_ws):
     """Service sends an init message with config after connecting."""
+    from loguru import logger
+
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = _make_stt()
+    errors = []
+    sink = logger.add(lambda message: errors.append(message), level="ERROR")
+    try:
+        await run_test(
+            stt,
+            frames_to_send=[SleepFrame(sleep=0.1)],
+        )
+    finally:
+        logger.remove(sink)
 
-    await run_test(
-        stt,
-        frames_to_send=[SleepFrame(sleep=0.1)],
-    )
+    # Pipecat's validate_complete() logs an error for any unset settings field.
+    assert errors == []
 
     text_sends = [json.loads(s) for s in fake.sent if isinstance(s, str)]
     init = next(m for m in text_sends if m.get("type") == "init")
