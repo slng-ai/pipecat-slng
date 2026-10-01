@@ -45,6 +45,10 @@ async def test_init_message_sent_on_start(patch_ws):
         await run_test(
             stt,
             frames_to_send=[SleepFrame(sleep=0.1)],
+            # ponytail: the first pipeline of the session pays a one-time cold
+            # start that can pass pipecat's 1.0s default on slow CI runners.
+            # If test order changes, move this to whichever test runs first.
+            start_timeout=5.0,
         )
     finally:
         logger.remove(sink)
