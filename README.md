@@ -108,7 +108,7 @@ Enable one prepared connection for the next utterance:
 ```python
 tts = SlngTTSService(
     api_key=os.environ["SLNG_API_KEY"],
-    world_part="us-east",
+    world_part="eu-west",  # Gradium runs in the EU regions
     model="gradium/tts:default",
     voice="QETTJoT4n_WmpL3w",
     warm_standby_enabled=True,  # default: False
