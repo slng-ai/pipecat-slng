@@ -4,12 +4,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Unit tests for SLNG TTS services (WebSocket + HTTP)."""
+"""Unit tests for the SLNG WebSocket TTS service."""
 
 import asyncio
-import io
 import json
-import wave
 from typing import Any
 
 import pytest
@@ -29,11 +27,12 @@ from pipecat.transcriptions.language import Language
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_slng import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
+from pipecat_slng import SlngTTSService, SlngTTSSettings
 
 
 def _make_tts():
     return SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
@@ -68,6 +67,7 @@ async def test_ws_pronunciation_ref_passed_through(
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     settings = SlngTTSSettings(pronunciation=pronunciation) if via_settings else None
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
@@ -125,182 +125,11 @@ async def test_binary_audio_becomes_audio_frame(patch_ws):
     assert audio_frames and audio_frames[0].audio == b"\x10\x11" * 100
 
 
-# ---------------------------------------------------------------------------
-# HTTP TTS service
-# ---------------------------------------------------------------------------
-
-
-class FakeResponse:
-    """Minimal stand-in for an aiohttp response."""
-
-    def __init__(self, status=200, body=b"", text="", content_type="audio/pcm"):
-        self.status = status
-        self._body = body
-        self._text = text
-        self.headers = {"Content-Type": content_type}
-
-    async def read(self):
-        return self._body
-
-    async def text(self):
-        return self._text
-
-
-class FakeRequestCtx:
-    """Async-context-manager returned by ``FakeAiohttpSession.post``."""
-
-    def __init__(self, response):
-        self._response = response
-
-    async def __aenter__(self):
-        return self._response
-
-    async def __aexit__(self, *args):
-        return False
-
-
-class FakeAiohttpSession:
-    """Records POST calls and returns a canned response."""
-
-    def __init__(self, response):
-        self._response = response
-        self.calls: list = []
-
-    def post(self, url, json=None, headers=None, params=None):
-        self.calls.append(
-            {"url": url, "json": json, "headers": headers, "params": params}
-        )
-        return FakeRequestCtx(self._response)
-
-    async def close(self):
-        pass
-
-
-def _make_http_tts(session, **overrides):
-    return SlngHttpTTSService(
-        api_key="test-key",
-        voice="aura-2-thalia-en",
-        sample_rate=24000,
-        aiohttp_session=session,
-        **overrides,
-    )
-
-
-def _make_wav(pcm: bytes, rate: int = 24000) -> bytes:
-    """Wrap raw 16-bit mono PCM in a WAV (RIFF) container."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
-
-
-async def test_http_posts_request_and_emits_audio():
-    """HTTP TTS POSTs the right request and emits the returned audio."""
-    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x10\x11" * 100))
-    tts = _make_http_tts(session)
-
-    down, _ = await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi there"), SleepFrame(sleep=0.2)],
-    )
-
-    assert session.calls, "no HTTP request was issued"
-    call = session.calls[0]
-    assert "/v1/bridges/unmute/tts/" in call["url"]
-    assert call["headers"]["Authorization"] == "Bearer test-key"
-    assert call["json"]["text"] == "hi there"
-    assert call["json"]["voice"] == "aura-2-thalia-en"
-    # The HTTP bridge body is {text, voice} only — no `config` object (sending
-    # one makes the bridge reject the payload with a 400).
-    assert "config" not in call["json"]
-    assert call["params"] is None  # no region/world overrides set
-
-    # A non-container response is passed through as raw PCM unchanged.
-    audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
-    assert audio_frames and audio_frames[0].audio == b"\x10\x11" * 100
-
-
-async def test_http_wav_response_is_decoded():
-    """A WAV (RIFF) response is decoded to raw PCM at the file's sample rate."""
-    pcm = b"\x10\x11" * 100
-    session = FakeAiohttpSession(
-        FakeResponse(
-            status=200, body=_make_wav(pcm, rate=24000), content_type="audio/wav"
-        )
-    )
-    tts = _make_http_tts(session)
-
-    down, _ = await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    audio_frames = [f for f in down if isinstance(f, TTSAudioRawFrame)]
-    assert audio_frames
-    assert audio_frames[0].audio == pcm  # RIFF/WAVE header stripped
-    assert audio_frames[0].sample_rate == 24000
-
-
-async def test_http_region_world_sent_as_query_params():
-    """region/world-part overrides go in the query string, not headers."""
-    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = _make_http_tts(
-        session, region_override="eu-north-1", world_part_override="eu"
-    )
-
-    await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    call = session.calls[0]
-    assert call["params"] == {"region": "eu-north-1", "world-part": "eu"}
-    assert "X-Region-Override" not in call["headers"]
-    assert "X-World-Part-Override" not in call["headers"]
-
-
-async def test_http_compressed_format_yields_error():
-    """A compressed (e.g. MP3) response is rejected, not emitted as PCM."""
-    session = FakeAiohttpSession(
-        FakeResponse(
-            status=200, body=b"ID3\x04\x00\x00\x00\x00", content_type="audio/mpeg"
-        )
-    )
-    tts = _make_http_tts(session)
-
-    down, up = await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    errors = [f for f in up if isinstance(f, ErrorFrame)]
-    assert errors and "format" in errors[0].error.lower()
-    assert not [f for f in down if isinstance(f, TTSAudioRawFrame)]
-
-
-async def test_http_non_200_yields_error_frame():
-    """A non-200 HTTP response yields an ErrorFrame and no audio."""
-    session = FakeAiohttpSession(FakeResponse(status=500, body=b"", text="boom"))
-    tts = _make_http_tts(session)
-
-    down, up = await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    # ErrorFrames are pushed upstream by the pipecat TTSService base class.
-    errors = [f for f in up if isinstance(f, ErrorFrame)]
-    assert errors and "500" in errors[0].error
-    assert not [f for f in down if isinstance(f, TTSAudioRawFrame)]
-
-
 async def test_ws_update_settings_reconnects(monkeypatch):
     """A changed setting reconnects without clearing unrelated settings."""
     pronunciation = {"mode": "rewrite", "name": "brand-pronunciations"}
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
@@ -348,27 +177,29 @@ async def test_ws_update_settings_noop_does_not_reconnect(monkeypatch):
     assert calls == []
 
 
-async def test_ws_region_and_world_headers_sent(patch_ws):
-    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
+async def test_ws_world_part_selects_regional_gateway(patch_ws):
+    """world_part picks the regional host; no routing headers are sent."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = SlngTTSService(
+        world_part="au",
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
-        region_override="ap-southeast-2",
-        world_part_override="ap",
     )
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
-    assert fake.connect_headers["X-Region-Override"] == "ap-southeast-2"
-    assert fake.connect_headers["X-World-Part-Override"] == "ap"
+    assert fake.connect_url == (
+        "wss://au.api.slng.ai/v1/bridges/unmute/tts/slng/deepgram/aura:2-en"
+    )
+    assert fake.connect_headers == {"Authorization": "Bearer test-key"}
 
 
 async def test_ws_provider_key_header_sent(patch_ws):
     """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         voice="aura-2-thalia-en",
         sample_rate=24000,
@@ -395,6 +226,7 @@ async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
     Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         model="deepgram/aura:2",  # external route — no slng/ prefix
         voice="aura-2-thalia-en",
@@ -406,51 +238,6 @@ async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
     assert fake.connect_headers["Authorization"] == "Bearer test-key"
     assert "X-Slng-Provider-Key" not in fake.connect_headers
     assert "deepgram/aura:2" in fake.connect_url
-
-
-async def test_http_provider_key_header_sent():
-    """provider_key maps to the X-Slng-Provider-Key request header (BYOK)."""
-    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = _make_http_tts(session, provider_key="my-provider-key")
-
-    await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    call = session.calls[0]
-    assert call["headers"]["X-Slng-Provider-Key"] == "my-provider-key"
-
-
-async def test_http_provider_key_header_absent_by_default():
-    """Without provider_key the BYOK header is never sent (route 1: default slng/ model)."""
-    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = _make_http_tts(session)
-
-    await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    call = session.calls[0]
-    assert "X-Slng-Provider-Key" not in call["headers"]
-
-
-async def test_http_route3_external_model_no_key_no_byok_header():
-    """Route 3 (HTTP TTS): an external model WITHOUT provider_key sends only
-    Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
-    session = FakeAiohttpSession(FakeResponse(status=200, body=b"\x00\x00" * 50))
-    tts = _make_http_tts(session, model="deepgram/aura:2")
-
-    await run_test(
-        tts,
-        frames_to_send=[TTSSpeakFrame(text="hi"), SleepFrame(sleep=0.2)],
-    )
-
-    call = session.calls[0]
-    assert call["headers"]["Authorization"] == "Bearer test-key"
-    assert "X-Slng-Provider-Key" not in call["headers"]
-    assert "deepgram/aura:2" in call["url"]
 
 
 async def test_v19_connect_rejection_includes_server_body(monkeypatch):
@@ -990,7 +777,10 @@ async def test_tts_interruption_retires_the_contaminated_stream(monkeypatch, ena
     """
     fakes = _collect_sockets(monkeypatch)
     tts = SlngTTSService(
-        api_key="test", sample_rate=24000, warm_standby_enabled=enabled
+        world_part="us-east",
+        api_key="test",
+        sample_rate=24000,
+        warm_standby_enabled=enabled,
     )
     stale, fresh = b"\x99\x99" * 100, b"\x33\x33" * 100
 
@@ -1097,6 +887,7 @@ async def test_tts_rejects_per_fragment_contexts_before_connecting(
 
     with pytest.raises(ValueError, match="reuse_context_id_within_turn"):
         SlngTTSService(
+            world_part="us-east",
             api_key="test-key",
             voice="aura-2-thalia-en",
             sample_rate=24000,
@@ -2755,7 +2546,11 @@ async def test_tts_warm_standby_selection(monkeypatch, enabled):
     monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
     options = {} if enabled is None else {"warm_standby_enabled": enabled}
     tts = SlngTTSService(
-        api_key="test-key", voice="voice", sample_rate=24000, **options
+        world_part="us-east",
+        api_key="test-key",
+        voice="voice",
+        sample_rate=24000,
+        **options,
     )
     sink = logger.add(
         lambda message: (
@@ -2870,6 +2665,7 @@ async def test_tts_warm_standby_fallback(monkeypatch, failure):
 
     monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="secret-test-key",
         voice="voice",
         sample_rate=24000,
@@ -2936,6 +2732,7 @@ async def test_tts_warm_standby_audio_isolation(monkeypatch, completion):
     """B waits for A's final audio, then uses a spare while A playback drains."""
     fakes = _collect_sockets(monkeypatch)
     tts = SlngTTSService(
+        world_part="us-east",
         api_key="test-key",
         voice="voice",
         sample_rate=24000,
@@ -3024,7 +2821,7 @@ async def test_tts_warm_standby_settings(monkeypatch, phase):
         sample_rate=24000,
         language=Language.EN,
         pronunciation=pronunciation,
-        region_override="eu-north-1",
+        world_part="eu-north",
         provider_key="provider-test-key",
         warm_standby_enabled=True,
     )
@@ -3072,12 +2869,15 @@ async def test_tts_warm_standby_settings(monkeypatch, phase):
             assert init["config"]["language"] == "hi"
             assert init["config"]["speed"] == 1.1
             assert init["config"]["pronunciation"] == {"name": "after"}
-        assert all(url.endswith("/gradium/tts:default") for url, _ in calls)
+        assert all(
+            url
+            == "wss://eu-north.api.slng.ai/v1/bridges/unmute/tts/gradium/tts:default"
+            for url, _ in calls
+        )
         assert all(
             headers
             == {
                 "Authorization": "Bearer test-key",
-                "X-Region-Override": "eu-north-1",
                 "X-Slng-Provider-Key": "provider-test-key",
             }
             for _, headers in calls
@@ -3124,7 +2924,11 @@ async def test_tts_warm_standby_cleanup(monkeypatch, phase, ending):
 
     monkeypatch.setattr("pipecat_slng.tts.websocket_connect", connect)
     tts = SlngTTSService(
-        api_key="test-key", voice="voice", sample_rate=24000, warm_standby_enabled=True
+        world_part="us-east",
+        api_key="test-key",
+        voice="voice",
+        sample_rate=24000,
+        warm_standby_enabled=True,
     )
     prepare = tts._prepare_standby
 
@@ -3187,7 +2991,9 @@ async def test_tts_warm_standby_failed_close_ownership(monkeypatch, standby):
     """Failed init/close retains ownership, and cannot prevent active teardown."""
     from conftest import FakeWebSocket
 
-    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    tts = SlngTTSService(
+        world_part="us-east", api_key="test", warm_standby_enabled=True
+    )
     active, broken = FakeWebSocket(), FakeWebSocket()
     close = broken.close
 
@@ -3221,7 +3027,9 @@ async def test_tts_warm_standby_buffered_audio(monkeypatch):
     """Queued unsolicited audio invalidates a ready spare at handoff."""
     from conftest import FakeWebSocket
 
-    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    tts = SlngTTSService(
+        world_part="us-east", api_key="test", warm_standby_enabled=True
+    )
     active = FakeWebSocket()
     spare = FakeWebSocket([json.dumps({"type": "ready"})])
     tts._websocket = active
@@ -3246,7 +3054,7 @@ async def test_tts_replacement_waits_for_own_ready(monkeypatch):
     """A prior ready cannot let replacement text bypass the init handshake."""
     from conftest import FakeWebSocket
 
-    tts = SlngTTSService(api_key="test")
+    tts = SlngTTSService(world_part="us-east", api_key="test")
     old, new = FakeWebSocket(), FakeWebSocket()
     await old.close()
     tts._websocket = old
@@ -3304,7 +3112,9 @@ async def test_tts_warm_standby_expected_eof_and_keepalive(monkeypatch):
     """Keepalive failure is isolated; completed EOF needs no redundant opener."""
     from conftest import FakeWebSocket
 
-    tts = SlngTTSService(api_key="test", warm_standby_enabled=True)
+    tts = SlngTTSService(
+        world_part="us-east", api_key="test", warm_standby_enabled=True
+    )
     active, spare = FakeWebSocket(), FakeWebSocket()
     tts._websocket, tts._standby_ws = active, spare
     tts._standby_ready = True
@@ -3356,7 +3166,12 @@ async def test_tts_warm_standby_ambiguous_send_is_not_replayed(monkeypatch):
     from conftest import FakeWebSocket
 
     sockets = []
-    tts = SlngTTSService(api_key="test", sample_rate=24000, warm_standby_enabled=True)
+    tts = SlngTTSService(
+        world_part="us-east",
+        api_key="test",
+        sample_rate=24000,
+        warm_standby_enabled=True,
+    )
 
     async def connect(*args, **kwargs):
         ws = FakeWebSocket([json.dumps({"type": "ready"})])
@@ -3409,7 +3224,10 @@ async def test_tts_warm_standby_mutable_settings_during_selection(monkeypatch):
 
     pronunciation = {"name": "before"}
     tts = SlngTTSService(
-        api_key="test", pronunciation=pronunciation, warm_standby_enabled=True
+        world_part="us-east",
+        api_key="test",
+        pronunciation=pronunciation,
+        warm_standby_enabled=True,
     )
     active, spare = FakeWebSocket(), FakeWebSocket()
     tts._websocket = active

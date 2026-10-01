@@ -17,6 +17,7 @@ Required services:
 Optional:
 - Model routing — set SLNG_STT_MODEL / SLNG_TTS_MODEL (+ SLNG_TTS_VOICE) to
   pick routes; both default to SLNG-hosted ``slng/...`` routes.
+- Region — set SLNG_WORLD_PART (default "us-east"), e.g. "in" or "eu-west".
 - BYOK — set SLNG_PROVIDER_KEY to your own provider key. On an external route
   (a model string without the ``slng/`` prefix) the provider bills you
   directly. See https://docs.slng.ai/execution-layer/byok
@@ -76,17 +77,22 @@ async def run_bot(transport: BaseTransport):
     tts_model = os.getenv("SLNG_TTS_MODEL", "slng/deepgram/aura:2-en")
     tts_voice = os.getenv("SLNG_TTS_VOICE", "aura-2-thalia-en")
     provider_key = os.getenv("SLNG_PROVIDER_KEY")
+    # SLNG region, e.g. "in" or "us-west". Each region has its own models:
+    # https://docs.slng.ai/models/catalog/by-region
+    world_part = os.getenv("SLNG_WORLD_PART", "us-east")
 
     stt = SlngSTTService(
         api_key=slng_api_key,
+        world_part=world_part,
         model=stt_model,
         provider_key=provider_key,
     )
 
     # Streaming WebSocket TTS — low latency, supports mid-utterance interruption.
-    # Swap SLNG_TTS_MODEL to switch route. For non-streaming HTTP, see SlngHttpTTSService.
+    # Swap SLNG_TTS_MODEL to switch route.
     tts = SlngTTSService(
         api_key=slng_api_key,
+        world_part=world_part,
         model=tts_model,
         voice=tts_voice,
         provider_key=provider_key,

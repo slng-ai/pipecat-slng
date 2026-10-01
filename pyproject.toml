@@ -1,16 +1,15 @@
 [project]
 name = "pipecat-slng"
 version = "0.6.0"
-description = "SLNG STT/TTS services for Pipecat (WebSocket + HTTP)"
+description = "SLNG STT/TTS services for Pipecat (WebSocket)"
 readme = "README.md"
 license = "BSD-2-Clause"
 requires-python = ">=3.11"
 authors = [{ name = "slng.ai" }]
-keywords = ["pipecat", "slng", "stt", "tts", "voice-ai", "websocket", "http"]
+keywords = ["pipecat", "slng", "stt", "tts", "voice-ai", "websocket"]
 dependencies = [
     "pipecat-ai>=1.8.0",
     "websockets>=13.0",
-    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]

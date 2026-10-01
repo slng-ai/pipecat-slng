@@ -23,7 +23,7 @@ from pipecat_slng import SlngSTTService
 
 
 def _make_stt():
-    return SlngSTTService(api_key="test-key", sample_rate=16000)
+    return SlngSTTService(world_part="us-east", api_key="test-key", sample_rate=16000)
 
 
 def _audio():
@@ -173,26 +173,29 @@ async def test_low_confidence_partial_is_dropped(patch_ws):
     assert not [f for f in down if isinstance(f, InterimTranscriptionFrame)]
 
 
-async def test_region_and_world_headers_sent(patch_ws):
-    """region_override + world_part_override map to X-Region-Override / X-World-Part-Override."""
+async def test_world_part_selects_regional_gateway(patch_ws):
+    """world_part picks the regional host; no routing headers are sent."""
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = SlngSTTService(
+        world_part="in",
         api_key="test-key",
         sample_rate=16000,
-        region_override="eu-north-1",
-        world_part_override="eu",
+        model="sarvam/saaras:v3",
     )
 
     await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
 
-    assert fake.connect_headers["X-Region-Override"] == "eu-north-1"
-    assert fake.connect_headers["X-World-Part-Override"] == "eu"
+    assert fake.connect_url == (
+        "wss://in.api.slng.ai/v1/bridges/unmute/stt/sarvam/saaras:v3"
+    )
+    assert fake.connect_headers == {"Authorization": "Bearer test-key"}
 
 
 async def test_provider_key_header_sent(patch_ws):
     """provider_key maps to the X-Slng-Provider-Key header (BYOK)."""
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = SlngSTTService(
+        world_part="us-east",
         api_key="test-key",
         sample_rate=16000,
         provider_key="my-provider-key",
@@ -219,6 +222,7 @@ async def test_route3_external_model_no_key_no_byok_header(patch_ws):
     (V21). The client never gates the route on the key (V17)."""
     fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
     stt = SlngSTTService(
+        world_part="us-east",
         api_key="test-key",
         model="deepgram/nova:3",  # external route — no slng/ prefix
         sample_rate=16000,

@@ -6,13 +6,14 @@
 
 """SLNG STT/TTS services for Pipecat."""
 
+from pipecat_slng._gateway import WorldPart
 from pipecat_slng.stt import SlngSTTService, SlngSTTSettings
-from pipecat_slng.tts import SlngHttpTTSService, SlngTTSService, SlngTTSSettings
+from pipecat_slng.tts import SlngTTSService, SlngTTSSettings
 
 __all__ = [
     "SlngSTTService",
     "SlngSTTSettings",
     "SlngTTSService",
     "SlngTTSSettings",
-    "SlngHttpTTSService",
+    "WorldPart",
 ]

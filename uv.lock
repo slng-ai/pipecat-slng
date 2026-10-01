@@ -1760,7 +1760,6 @@ name = "pipecat-slng"
 version = "0.6.0"
 source = { editable = "." }
 dependencies = [
-    { name = "aiohttp" },
     { name = "pipecat-ai" },
     { name = "websockets" },
 ]
@@ -1781,7 +1780,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9" },
     { name = "pipecat-ai", specifier = ">=1.8.0" },
     { name = "pipecat-ai", extras = ["runner", "silero", "webrtc", "openai"], marker = "extra == 'example'", specifier = ">=1.8.0" },
     { name = "python-dotenv", marker = "extra == 'example'", specifier = ">=1.0" },
