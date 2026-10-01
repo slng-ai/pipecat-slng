@@ -175,14 +175,32 @@ Every service needs a `world_part`. It picks the SLNG region that handles the
 request. Each region has its own gateway at `{world_part}.api.slng.ai`.
 Requests are not routed between regions.
 
+For example, Soniox STT and Fish TTS, both in Germany (`eu-west`):
+
 ```python
+import os
+
+from pipecat.transcriptions.language import Language
+from pipecat_slng import SlngSTTService, SlngTTSService
+
+stt = SlngSTTService(
+    api_key=os.getenv("SLNG_API_KEY"),
+    world_part="eu-west",  # or WorldPart.EU_WEST
+    model="soniox/speech-ai:rt-v5",
+    language=Language.EN,
+)
+
 tts = SlngTTSService(
     api_key=os.getenv("SLNG_API_KEY"),
-    world_part="in",  # or WorldPart.IN
-    model="sarvam/bulbul:v3",
-    voice="shubh",
+    world_part="eu-west",
+    model="slng/fish/tts:s2.1-pro",
+    voice="1258154bb41540c7b9dc0d10cd6704bf",
+    language=Language.EN,
 )
 ```
+
+Each service takes its own `world_part`, so STT and TTS can run in different
+regions.
 
 | Region | `world_part` |
 | - | - |
