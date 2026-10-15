@@ -221,6 +221,34 @@ async def test_ws_provider_key_header_absent_by_default(patch_ws):
     assert "X-Slng-Provider-Key" not in fake.connect_headers
 
 
+async def test_tracking_headers_sent(patch_ws):
+    """external_agent_id / external_session_id map to the X-SLNG-* headers, stripped."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = SlngTTSService(
+        world_part="us-east",
+        api_key="test-key",
+        voice="aura-2-thalia-en",
+        sample_rate=24000,
+        external_agent_id=" agent-1 ",
+        external_session_id=" call-9 ",
+    )
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-SLNG-Agent-Id"] == "agent-1"
+    assert fake.connect_headers["X-SLNG-Session-Id"] == "call-9"
+
+
+async def test_tracking_headers_absent_by_default(patch_ws):
+    """Without the ids no tracking header is sent."""
+    fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
+    tts = _make_tts()
+
+    await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert not any(h.startswith("X-SLNG-") for h in fake.connect_headers)
+
+
 async def test_ws_route3_external_model_no_key_no_byok_header(patch_ws):
     """Route 3 (WS TTS): an external model WITHOUT provider_key sends only
     Authorization, no BYOK header — served via SLNG's own provider account (V21)."""
@@ -2823,6 +2851,8 @@ async def test_tts_warm_standby_settings(monkeypatch, phase):
         pronunciation=pronunciation,
         world_part="eu-north",
         provider_key="provider-test-key",
+        external_agent_id="agent-1",
+        external_session_id="call-9",
         warm_standby_enabled=True,
     )
 
@@ -2879,6 +2909,8 @@ async def test_tts_warm_standby_settings(monkeypatch, phase):
             == {
                 "Authorization": "Bearer test-key",
                 "X-Slng-Provider-Key": "provider-test-key",
+                "X-SLNG-Agent-Id": "agent-1",
+                "X-SLNG-Session-Id": "call-9",
             }
             for _, headers in calls
         )

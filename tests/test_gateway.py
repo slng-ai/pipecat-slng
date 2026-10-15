@@ -4,11 +4,12 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Tests for WorldPart: regional host, URL building, and base_url migration."""
+"""Tests for WorldPart (regional host, URL building, base_url migration) and tracking headers."""
 
 import pytest
 
 from pipecat_slng import SlngSTTService, SlngTTSService, WorldPart
+from pipecat_slng._gateway import tracking_headers
 
 
 @pytest.mark.parametrize("world_part", list(WorldPart))
@@ -56,3 +57,44 @@ def test_services_require_world_part(service):
 def test_services_reject_old_gateway(service):
     with pytest.raises(ValueError, match="no longer supported"):
         service(api_key="test-key", world_part="in", base_url="api.slng.ai")
+
+
+def test_tracking_headers_strip_values():
+    assert tracking_headers(" agent-1 ", "\tcall-9\n") == {
+        "X-SLNG-Agent-Id": "agent-1",
+        "X-SLNG-Session-Id": "call-9",
+    }
+
+
+def test_tracking_headers_none_sends_nothing():
+    assert tracking_headers(None, None) == {}
+    assert tracking_headers("agent-1", None) == {"X-SLNG-Agent-Id": "agent-1"}
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("", "must not be empty"),
+        ("   ", "must not be empty"),
+        ("a" * 129, "must be 128 characters or fewer"),
+        ("a,b", "must not contain commas or control characters"),
+        ("a\nb", "must not contain commas or control characters"),
+        (123, "must be a string"),
+    ],
+)
+@pytest.mark.parametrize("name", ["external_agent_id", "external_session_id"])
+def test_tracking_headers_reject_bad_ids(name, value, message):
+    with pytest.raises(ValueError, match=f"^{name} {message}$"):
+        tracking_headers(
+            **{"external_agent_id": None, "external_session_id": None, name: value}
+        )
+
+
+def test_tracking_id_of_128_chars_is_accepted():
+    assert tracking_headers("a" * 128, None) == {"X-SLNG-Agent-Id": "a" * 128}
+
+
+@pytest.mark.parametrize("service", [SlngSTTService, SlngTTSService])
+def test_services_reject_bad_tracking_id(service):
+    with pytest.raises(ValueError, match="external_session_id must not be empty"):
+        service(api_key="test-key", world_part="in", external_session_id=" ")
