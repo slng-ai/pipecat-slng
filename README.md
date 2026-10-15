@@ -39,13 +39,19 @@ mid-utterance interruption, and exposes the full SLNG config surface
 
 ```python
 import os
+import uuid
 
 from pipecat_slng import SlngSTTService, SlngTTSService
+
+agent_id = "my-agent"           # names your agent in SLNG usage
+session_id = str(uuid.uuid4())  # one id per call; use your own call id if you have one
 
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
     world_part="us-east",
     model="slng/deepgram/nova:3-en",
+    external_agent_id=agent_id,
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -53,8 +59,14 @@ tts = SlngTTSService(
     world_part="us-east",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
+    external_agent_id=agent_id,
+    external_session_id=session_id,
 )
 ```
+
+Always pass `external_agent_id` and `external_session_id`. SLNG uses them to
+group your usage by agent and by call. See
+[Usage tracking](#usage-tracking-agent-id-and-session-id).
 
 Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
 `enable_partials=`). For richer overrides pass a
@@ -100,6 +112,28 @@ Three behaviors worth knowing:
 - **Runtime settings updates.** Changing `voice`, `speed`, or `language`
   mid-session (via Pipecat settings updates) reconnects the WebSocket to
   re-run the init handshake — expect a brief reconnect, not a silent no-op.
+
+### Usage tracking: agent id and session id
+
+Pass `external_agent_id` and `external_session_id` to every service you build.
+SLNG uses them to group usage by agent and by call.
+
+- `external_agent_id`: a stable name for your agent, e.g. `"support-bot"`.
+- `external_session_id`: one id per call. Use the id your telephony or
+  transport already gives you, e.g. a Twilio `CallSid` or Pipecat's
+  `runner_args.session_id`.
+- If you leave them out, the service still works, but SLNG cannot tell your
+  agents and calls apart.
+- They are sent as the `X-SLNG-Agent-Id` and `X-SLNG-Session-Id` headers on
+  every WebSocket the service opens. For TTS this includes reconnects and the
+  warm standby socket.
+- Each value is stripped, must be 1 to 128 characters, and must not contain a
+  comma or a control character. A bad value raises `ValueError` when the
+  service is built.
+- The names and rules are the same as in `livekit-plugins-slng`.
+
+The ids are fixed for the life of the service. Build new services for each
+call. The [full example](#full-example-with-usage-tracking) below does this.
 
 ### Optional TTS warm standby
 
@@ -179,15 +213,20 @@ For example, Soniox STT and Fish TTS, both in Germany (`eu-west`):
 
 ```python
 import os
+import uuid
 
 from pipecat.transcriptions.language import Language
 from pipecat_slng import SlngSTTService, SlngTTSService
+
+session_id = str(uuid.uuid4())
 
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
     world_part="eu-west",  # or WorldPart.EU_WEST
     model="soniox/speech-ai:rt-v5",
     language=Language.EN,
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -196,6 +235,8 @@ tts = SlngTTSService(
     model="slng/fish/tts:s2.1-pro",
     voice="1258154bb41540c7b9dc0d10cd6704bf",
     language=Language.EN,
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 ```
 
@@ -273,6 +314,8 @@ stt = SlngSTTService(
     world_part="us-east",
     model="deepgram/nova:3",                      # external route — no slng/ prefix
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),  # your own provider key
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -281,6 +324,8 @@ tts = SlngTTSService(
     model="deepgram/aura:2",                      # external route — no slng/ prefix
     voice="aura-2-thalia-en",
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 ```
 
@@ -300,11 +345,250 @@ uv run --extra example examples/bot.py
 ```
 
 Then open http://localhost:7860/client in your browser and start talking.
+The bot sends `SLNG_AGENT_ID` (default `pipecat-slng-example`) and the runner's
+session id on every connection.
 Pick the region with `SLNG_WORLD_PART` (default `us-east`).
 Pick models with `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` (both default to `slng/...`
 self-hosted routes); set `SLNG_PROVIDER_KEY` to your own provider key to run an
 external route in BYOK mode. The bot uses the SmallWebRTC transport by default;
 pass `-t daily` to use Daily instead (requires installing `pipecat-ai[daily]`).
+
+### Full example with usage tracking
+
+A complete bot with a weather tool. It sends the agent id and the session id on
+every SLNG connection:
+
+- `agent_id` comes from `SLNG_AGENT_ID`.
+- `session_id` is the id Pipecat's runner gives each session. The bot makes a
+  new UUID if the runner gives none.
+
+It needs `pipecat-slng>=0.7.0`, `pipecat-ai[daily,openai,runner,silero,webrtc]`
+and `dotenv`. Run it with `uv run bot.py`.
+
+<details>
+<summary><code>bot.py</code></summary>
+
+```python
+"""Pipecat voice bot: SLNG STT -> OpenAI LLM -> SLNG TTS.
+
+Transports: only ``webrtc`` is wired, for browser testing. Production swaps in
+``twilio`` (``FastAPIWebsocketParams``, which sets ``add_wav_header`` and the
+serializer itself) or ``daily`` (``DailyParams``); both take the same
+``audio_in_enabled``/``audio_out_enabled`` pair.
+
+Environment:
+    SLNG_API_KEY, OPENAI_API_KEY -- required.
+    SLNG_STT_MODEL -- an ``slng/...`` route is SLNG-hosted; anything else is an
+        external provider proxied through SLNG.
+    SLNG_STT_TTFS_P99 -- the safety-net timer Pipecat waits out when STT never
+        finalizes a transcript. The plugin finalizes as of 0.5.0, so this now
+        only covers an unanswered finalize, but leaving it unset means a 1.0s
+        default plus a warning on every run. Measured at the default
+        ``stop_secs=0.2``: 605ms median on ``slng/deepgram/nova:3-en``, 280ms on
+        ``deepgram/nova:3``. The 0.7 default clears both.
+    SLNG_TTS_MODEL, SLNG_TTS_VOICE -- TTS route and voice.
+
+Each service needs ``world_part``, the SLNG region to call, e.g. ``"in"`` or
+``"us-west"``. Models differ by region:
+https://docs.slng.ai/models/catalog/by-region
+"""
+
+import logging
+import os
+import uuid
+from collections.abc import Callable
+
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+	LLMContextAggregatorPair,
+	LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transcriptions.language import Language
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.workers.runner import WorkerRunner
+from pipecat_slng import SlngSTTService, SlngTTSService
+from dotenv import load_dotenv
+from tools.weather import WEATHER_SCHEMA, get_current_weather
+
+load_dotenv()
+
+
+logger = logging.getLogger(__name__)
+
+
+transport_params: dict[str, Callable[..., TransportParams]] = {
+	"webrtc": lambda: TransportParams(
+		audio_in_enabled=True,
+		audio_out_enabled=True,
+	),
+}
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+	"""Build the STT/LLM/TTS pipeline and run it until the client disconnects."""
+	logging.basicConfig(filename="myapp.log", level=logging.INFO)
+	logger.info("Starting bot")
+	slng_api_key = os.environ["SLNG_API_KEY"]
+	# SLNG groups usage by these ids (X-SLNG-Agent-Id / X-SLNG-Session-Id headers).
+	agent_id = os.getenv("SLNG_AGENT_ID", "pipecat-slng-example")
+	session_id = runner_args.session_id or str(uuid.uuid4())
+	logger.info(f"SLNG tracking: agent_id={agent_id} session_id={session_id}")
+
+	runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+	stt = SlngSTTService(
+		api_key=slng_api_key,
+		model="soniox/speech-ai:rt-v5",
+		language=Language.EN,
+		world_part="eu-north",
+		external_agent_id=agent_id,
+		external_session_id=session_id,
+	)
+
+	llm = OpenAILLMService(
+		api_key=os.environ["OPENAI_API_KEY"],
+		settings=OpenAILLMService.Settings(
+			system_instruction="You are a helpful voice assistant. Keep responses brief.",
+		),
+	)
+
+	tts = SlngTTSService(
+		api_key=slng_api_key,
+		model="slng/fish/tts:s2.1-pro",
+		voice="1258154bb41540c7b9dc0d10cd6704bf",
+		language=Language.EN,
+		world_part="eu-north",
+		warm_standby_enabled=True,
+		external_agent_id=agent_id,
+		external_session_id=session_id,
+	)
+
+	llm.register_function("get_current_weather", get_current_weather)
+
+	context = LLMContext(tools=ToolsSchema(standard_tools=[WEATHER_SCHEMA]))
+	aggregators = LLMContextAggregatorPair(
+		context,
+		user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+	)
+
+	pipeline = Pipeline(
+		[
+			transport.input(),
+			stt,
+			aggregators.user(),
+			llm,
+			tts,
+			transport.output(),
+			aggregators.assistant(),
+		]
+	)
+
+	agent_1 = PipelineWorker(
+		pipeline,
+		name="assistant",
+		params=PipelineParams(
+			audio_in_sample_rate=16000,
+			audio_out_sample_rate=24000,
+			enable_metrics=True,
+			enable_usage_metrics=True,
+		),
+	)
+
+	@agent_1.rtvi.event_handler("on_client_ready")
+	async def on_client_ready(rtvi):
+		"""Greet the caller once the client has sent "client-ready".
+
+		This is an RTVI event, not a transport event -- the worker auto-creates
+		the RTVI processor, so the handler registers on ``agent_1.rtvi``.
+		"""
+		await agent_1.queue_frames(
+			[
+				TTSSpeakFrame(
+					"Hi! I am a voice assistant here to help you or chat with you. How can I help you today?"
+				)
+			]
+		)
+
+	@transport.event_handler("on_client_connected")
+	async def on_client_connected(transport, client):
+		"""Log the connection."""
+		logger.info("Client connected")
+
+	@transport.event_handler("on_client_disconnected")
+	async def on_client_disconnected(transport, client):
+		"""Shut the runner down when the caller hangs up."""
+		await runner.cancel()
+
+	await runner.add_workers(agent_1)
+	await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+	"""Runner entry point: build the transport, then run the pipeline."""
+	transport = await create_transport(runner_args, transport_params)
+	await run_bot(transport, runner_args)
+
+
+if __name__ == "__main__":
+	from pipecat.runner.run import main
+
+	main()
+```
+
+</details>
+
+<details>
+<summary><code>tools/weather.py</code></summary>
+
+```python
+"""Weather tool for the example bot.
+
+The schema is declared explicitly because on pipecat 1.3.0 the ``tools``
+argument only accepts a ``ToolsSchema``, and "direct" functions (params plus
+required named args) cannot satisfy the ``DirectFunction`` protocol under
+``ty``. So the schema is advertised here and the handler is registered
+separately via ``llm.register_function``.
+"""
+
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.services.llm_service import FunctionCallParams
+
+WEATHER_SCHEMA = FunctionSchema(
+	name="get_current_weather",
+	description="Get the current weather.",
+	properties={
+		"location": {
+			"type": "string",
+			"description": 'The city and state, e.g. "San Francisco, CA".',
+		},
+		"format": {
+			"type": "string",
+			"enum": ["celsius", "fahrenheit"],
+			"description": "The temperature unit to use.",
+		},
+	},
+	required=["location", "format"],
+)
+
+
+async def get_current_weather(params: FunctionCallParams):
+	"""Handle a get_current_weather call.
+
+	The LLM arguments arrive in ``params.arguments`` as ``location`` and
+	``format``; this stub ignores them and returns a fixed reading.
+	"""
+	await params.result_callback({"conditions": "sunny", "temperature": "31"})
+```
+
+</details>
 
 ## Development
 
