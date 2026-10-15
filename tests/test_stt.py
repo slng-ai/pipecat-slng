@@ -220,6 +220,33 @@ async def test_provider_key_header_absent_by_default(patch_ws):
     assert "X-Slng-Provider-Key" not in fake.connect_headers
 
 
+async def test_tracking_headers_sent(patch_ws):
+    """external_agent_id / external_session_id map to the X-SLNG-* headers, stripped."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = SlngSTTService(
+        world_part="us-east",
+        api_key="test-key",
+        sample_rate=16000,
+        external_agent_id=" agent-1 ",
+        external_session_id=" call-9 ",
+    )
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert fake.connect_headers["X-SLNG-Agent-Id"] == "agent-1"
+    assert fake.connect_headers["X-SLNG-Session-Id"] == "call-9"
+
+
+async def test_tracking_headers_absent_by_default(patch_ws):
+    """Without the ids no tracking header is sent."""
+    fake = patch_ws("pipecat_slng.stt", [json.dumps({"type": "ready"})])
+    stt = _make_stt()
+
+    await run_test(stt, frames_to_send=[SleepFrame(sleep=0.1)])
+
+    assert not any(h.startswith("X-SLNG-") for h in fake.connect_headers)
+
+
 async def test_route3_external_model_no_key_no_byok_header(patch_ws):
     """Route 3: an external model WITHOUT provider_key sends only Authorization,
     no BYOK header. SLNG serves the external route via its own provider account

@@ -5,6 +5,20 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-15
+
+### Added
+
+- `external_agent_id` and `external_session_id` arguments on `SlngSTTService`
+  and `SlngTTSService`. SLNG uses them to group usage by agent and by call.
+  They are sent as the `X-SLNG-Agent-Id` and `X-SLNG-Session-Id` headers on
+  every WebSocket upgrade, including TTS reconnects and the warm standby
+  socket. Both are optional. `None` sends no header.
+- Each id is checked when the service is built, with the same rules and error
+  texts as `livekit-plugins-slng`. Surrounding whitespace is stripped. An id
+  that is not a string, is empty, is longer than 128 characters, or contains
+  a comma or a control character raises `ValueError`.
+
 ## [0.6.0] - 2026-10-01
 
 ### Added

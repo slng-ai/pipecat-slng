@@ -33,7 +33,7 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat_slng._errors import connect_error_detail
-from pipecat_slng._gateway import WorldPart
+from pipecat_slng._gateway import WorldPart, tracking_headers
 
 _DEFAULT_TTS_MODEL = "slng/deepgram/aura:2-en"
 
@@ -129,6 +129,8 @@ class SlngTTSService(WebsocketTTSService):
         encoding: str = "linear16",
         sample_rate: int | None = None,
         provider_key: str | None = None,
+        external_agent_id: str | None = None,
+        external_session_id: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
         pronunciation: dict[str, str] | None = None,
@@ -157,6 +159,10 @@ class SlngTTSService(WebsocketTTSService):
                 key surfaces as a ``backend_connection_failed`` error frame with
                 the upstream 401/403 detail. See
                 https://docs.slng.ai/execution-layer/byok.
+            external_agent_id: Optional tracking ID attached to usage events
+                as the ``X-SLNG-Agent-Id`` header (max 128 chars).
+            external_session_id: Optional tracking ID attached to usage events
+                as the ``X-SLNG-Session-Id`` header (max 128 chars).
             language: Synthesis language. Defaults to ``Language.EN`` when not given.
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
             pronunciation: Optional session pronunciation dictionary reference,
@@ -171,6 +177,9 @@ class SlngTTSService(WebsocketTTSService):
         """
         # Fail fast, before the parent service is built.
         resolved_world_part = WorldPart.resolve(world_part, base_url)
+        self._tracking_headers = tracking_headers(
+            external_agent_id, external_session_id
+        )
 
         default_settings = self.Settings(
             model=model,
@@ -251,6 +260,7 @@ class SlngTTSService(WebsocketTTSService):
         headers = {"Authorization": f"Bearer {self._api_key}"}
         if self._provider_key:
             headers["X-Slng-Provider-Key"] = self._provider_key
+        headers.update(self._tracking_headers)
         init = {"type": "init", "config": self._build_config()}
         if self._settings.voice:
             init["voice"] = str(self._settings.voice)

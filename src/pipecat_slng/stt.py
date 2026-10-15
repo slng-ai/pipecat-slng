@@ -37,7 +37,7 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
 from pipecat_slng._errors import connect_error_detail
-from pipecat_slng._gateway import WorldPart
+from pipecat_slng._gateway import WorldPart, tracking_headers
 
 _DEFAULT_STT_MODEL = "slng/deepgram/nova:3-en"
 
@@ -84,6 +84,8 @@ class SlngSTTService(WebsocketSTTService):
         encoding: str = "linear16",
         sample_rate: int | None = None,
         provider_key: str | None = None,
+        external_agent_id: str | None = None,
+        external_session_id: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         enable_partials: bool | NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
@@ -109,6 +111,10 @@ class SlngSTTService(WebsocketSTTService):
                 key surfaces as a ``backend_connection_failed`` error frame with
                 the upstream 401/403 detail. See
                 https://docs.slng.ai/execution-layer/byok.
+            external_agent_id: Optional tracking ID attached to usage events
+                as the ``X-SLNG-Agent-Id`` header (max 128 chars).
+            external_session_id: Optional tracking ID attached to usage events
+                as the ``X-SLNG-Session-Id`` header (max 128 chars).
             language: Recognition language. When not given, none is sent and the
                 gateway applies the selected model's default language, defined
                 per model in the SLNG catalog: e.g. ``hi`` on
@@ -124,6 +130,9 @@ class SlngSTTService(WebsocketSTTService):
         """
         # Fail fast, before the parent service is built.
         resolved_world_part = WorldPart.resolve(world_part, base_url)
+        self._tracking_headers = tracking_headers(
+            external_agent_id, external_session_id
+        )
 
         default_settings = self.Settings(
             model=model,
@@ -315,6 +324,7 @@ class SlngSTTService(WebsocketSTTService):
             headers: dict[str, str] = {"Authorization": f"Bearer {self._api_key}"}
             if self._provider_key:
                 headers["X-Slng-Provider-Key"] = self._provider_key
+            headers.update(self._tracking_headers)
 
             self._ready_event.clear()
             self._websocket = await websocket_connect(

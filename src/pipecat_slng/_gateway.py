@@ -10,9 +10,13 @@ Each region runs its own gateway at ``{region}.api.slng.ai``. Requests are not
 routed between regions. See https://docs.slng.ai/models/catalog/by-region.
 """
 
+import re
 import warnings
 from enum import StrEnum
 from urllib.parse import quote, urlsplit
+
+_TRACKING_ID_MAX_LENGTH = 128
+_TRACKING_ID_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f,]")
 
 
 class WorldPart(StrEnum):
@@ -86,3 +90,58 @@ class WorldPart(StrEnum):
             stacklevel=3,
         )
         return resolved
+
+
+def _normalize_tracking_id(value: object, name: str) -> str:
+    """Check one tracking ID the same way livekit-plugins-slng does.
+
+    Args:
+        value: The ID passed by the caller.
+        name: The argument name, used in error messages.
+
+    Returns:
+        The ID with surrounding whitespace removed.
+
+    Raises:
+        ValueError: If the ID is not a string, is empty, is longer than 128
+            characters, or holds a comma or a control character.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    if len(value) > _TRACKING_ID_MAX_LENGTH:
+        raise ValueError(
+            f"{name} must be {_TRACKING_ID_MAX_LENGTH} characters or fewer"
+        )
+    if _TRACKING_ID_FORBIDDEN.search(value):
+        raise ValueError(f"{name} must not contain commas or control characters")
+    return value
+
+
+def tracking_headers(
+    external_agent_id: str | None, external_session_id: str | None
+) -> dict[str, str]:
+    """Build the usage-tracking headers for the WebSocket upgrade.
+
+    Args:
+        external_agent_id: Sent as ``X-SLNG-Agent-Id``. ``None`` sends nothing.
+        external_session_id: Sent as ``X-SLNG-Session-Id``. ``None`` sends nothing.
+
+    Returns:
+        Zero, one or two headers.
+
+    Raises:
+        ValueError: If an ID fails the checks in ``_normalize_tracking_id``.
+    """
+    headers: dict[str, str] = {}
+    if external_agent_id is not None:
+        headers["X-SLNG-Agent-Id"] = _normalize_tracking_id(
+            external_agent_id, "external_agent_id"
+        )
+    if external_session_id is not None:
+        headers["X-SLNG-Session-Id"] = _normalize_tracking_id(
+            external_session_id, "external_session_id"
+        )
+    return headers
