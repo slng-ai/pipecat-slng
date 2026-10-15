@@ -39,13 +39,19 @@ mid-utterance interruption, and exposes the full SLNG config surface
 
 ```python
 import os
+import uuid
 
 from pipecat_slng import SlngSTTService, SlngTTSService
+
+agent_id = "my-agent"           # names your agent in SLNG usage
+session_id = str(uuid.uuid4())  # one id per call; use your own call id if you have one
 
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
     world_part="us-east",
     model="slng/deepgram/nova:3-en",
+    external_agent_id=agent_id,
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -53,8 +59,14 @@ tts = SlngTTSService(
     world_part="us-east",
     model="slng/deepgram/aura:2-en",
     voice="aura-2-thalia-en",
+    external_agent_id=agent_id,
+    external_session_id=session_id,
 )
 ```
+
+Always pass `external_agent_id` and `external_session_id`. SLNG uses them to
+group your usage by agent and by call. See
+[Usage tracking](#usage-tracking-agent-id-and-session-id).
 
 Common runtime knobs are top-level kwargs (e.g. `language=`, `speed=`,
 `enable_partials=`). For richer overrides pass a
@@ -103,19 +115,15 @@ Three behaviors worth knowing:
 
 ### Usage tracking: agent id and session id
 
-Pass `external_agent_id` and `external_session_id` to group SLNG usage by
-agent and by call:
+Pass `external_agent_id` and `external_session_id` to every service you build.
+SLNG uses them to group usage by agent and by call.
 
-```python
-stt = SlngSTTService(
-    api_key=os.getenv("SLNG_API_KEY"),
-    world_part="us-east",
-    external_agent_id="support-bot",
-    external_session_id=call_id,
-)
-```
-
-- Both are optional. `None` sends nothing.
+- `external_agent_id`: a stable name for your agent, e.g. `"support-bot"`.
+- `external_session_id`: one id per call. Use the id your telephony or
+  transport already gives you, e.g. a Twilio `CallSid` or Pipecat's
+  `runner_args.session_id`.
+- If you leave them out, the service still works, but SLNG cannot tell your
+  agents and calls apart.
 - They are sent as the `X-SLNG-Agent-Id` and `X-SLNG-Session-Id` headers on
   every WebSocket the service opens. For TTS this includes reconnects and the
   warm standby socket.
@@ -205,15 +213,20 @@ For example, Soniox STT and Fish TTS, both in Germany (`eu-west`):
 
 ```python
 import os
+import uuid
 
 from pipecat.transcriptions.language import Language
 from pipecat_slng import SlngSTTService, SlngTTSService
+
+session_id = str(uuid.uuid4())
 
 stt = SlngSTTService(
     api_key=os.getenv("SLNG_API_KEY"),
     world_part="eu-west",  # or WorldPart.EU_WEST
     model="soniox/speech-ai:rt-v5",
     language=Language.EN,
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -222,6 +235,8 @@ tts = SlngTTSService(
     model="slng/fish/tts:s2.1-pro",
     voice="1258154bb41540c7b9dc0d10cd6704bf",
     language=Language.EN,
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 ```
 
@@ -299,6 +314,8 @@ stt = SlngSTTService(
     world_part="us-east",
     model="deepgram/nova:3",                      # external route — no slng/ prefix
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),  # your own provider key
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 
 tts = SlngTTSService(
@@ -307,6 +324,8 @@ tts = SlngTTSService(
     model="deepgram/aura:2",                      # external route — no slng/ prefix
     voice="aura-2-thalia-en",
     provider_key=os.getenv("SLNG_PROVIDER_KEY"),
+    external_agent_id="my-agent",
+    external_session_id=session_id,
 )
 ```
 
@@ -326,6 +345,8 @@ uv run --extra example examples/bot.py
 ```
 
 Then open http://localhost:7860/client in your browser and start talking.
+The bot sends `SLNG_AGENT_ID` (default `pipecat-slng-example`) and the runner's
+session id on every connection.
 Pick the region with `SLNG_WORLD_PART` (default `us-east`).
 Pick models with `SLNG_STT_MODEL` / `SLNG_TTS_MODEL` (both default to `slng/...`
 self-hosted routes); set `SLNG_PROVIDER_KEY` to your own provider key to run an

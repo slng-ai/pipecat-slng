@@ -13,6 +13,8 @@ unified STT and TTS gateway. Defaults to the streaming WebSocket TTS service
 Required services:
 - SLNG (STT + TTS) — set SLNG_API_KEY
 - OpenAI (LLM)      — set OPENAI_API_KEY
+- Usage tracking    — SLNG_AGENT_ID (default "pipecat-slng-example") and the
+  runner's session id are sent on every SLNG connection.
 
 Optional:
 - Model routing — set SLNG_STT_MODEL / SLNG_TTS_MODEL (+ SLNG_TTS_VOICE) to
@@ -33,6 +35,7 @@ instead (requires ``pipecat-ai[daily]``).
 """
 
 import os
+import uuid
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -60,7 +63,7 @@ from pipecat_slng import SlngSTTService, SlngTTSService
 load_dotenv(override=True)
 
 
-async def run_bot(transport: BaseTransport):
+async def run_bot(transport: BaseTransport, session_id: str):
     """Main bot logic."""
     logger.info("Starting bot")
 
@@ -80,12 +83,17 @@ async def run_bot(transport: BaseTransport):
     # SLNG region, e.g. "in" or "us-west". Each region has its own models:
     # https://docs.slng.ai/models/catalog/by-region
     world_part = os.getenv("SLNG_WORLD_PART", "us-east")
+    # SLNG groups usage by agent and by call (X-SLNG-Agent-Id / X-SLNG-Session-Id).
+    agent_id = os.getenv("SLNG_AGENT_ID", "pipecat-slng-example")
+    logger.info(f"SLNG tracking: agent_id={agent_id} session_id={session_id}")
 
     stt = SlngSTTService(
         api_key=slng_api_key,
         world_part=world_part,
         model=stt_model,
         provider_key=provider_key,
+        external_agent_id=agent_id,
+        external_session_id=session_id,
     )
 
     # Streaming WebSocket TTS — low latency, supports mid-utterance interruption.
@@ -97,6 +105,8 @@ async def run_bot(transport: BaseTransport):
         voice=tts_voice,
         provider_key=provider_key,
         pronunciation={"mode": "rewrite", "name": "brand-pronunciations"},
+        external_agent_id=agent_id,
+        external_session_id=session_id,
     )
 
     llm = OpenAIResponsesLLMService(
@@ -200,7 +210,7 @@ async def bot(runner_args: RunnerArguments):
             logger.error(f"Unsupported runner arguments type: {type(runner_args)}")
             return
 
-    await run_bot(transport)
+    await run_bot(transport, runner_args.session_id or str(uuid.uuid4()))
 
 
 if __name__ == "__main__":
