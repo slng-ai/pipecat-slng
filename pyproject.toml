@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-slng"
-version = "0.6.0"
+version = "0.7.0"
 description = "SLNG STT/TTS services for Pipecat (WebSocket)"
 readme = "README.md"
 license = "BSD-2-Clause"
