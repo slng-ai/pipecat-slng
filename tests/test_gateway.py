@@ -68,7 +68,15 @@ def test_tracking_headers_strip_values():
 
 def test_tracking_headers_none_sends_nothing():
     assert tracking_headers(None, None) == {}
+    assert tracking_headers(None, None, None) == {}
     assert tracking_headers("agent-1", None) == {"X-SLNG-Agent-Id": "agent-1"}
+
+
+def test_tracking_headers_project_id():
+    project_id = "3f2b6c1e-8a4d-4f7e-9b2a-1c5d7e9f0a12"
+    assert tracking_headers(None, None, f" {project_id} ") == {
+        "X-SLNG-Project-Id": project_id
+    }
 
 
 @pytest.mark.parametrize(
@@ -82,7 +90,9 @@ def test_tracking_headers_none_sends_nothing():
         (123, "must be a string"),
     ],
 )
-@pytest.mark.parametrize("name", ["external_agent_id", "external_session_id"])
+@pytest.mark.parametrize(
+    "name", ["external_agent_id", "external_session_id", "project_id"]
+)
 def test_tracking_headers_reject_bad_ids(name, value, message):
     with pytest.raises(ValueError, match=f"^{name} {message}$"):
         tracking_headers(

@@ -121,16 +121,19 @@ def _normalize_tracking_id(value: object, name: str) -> str:
 
 
 def tracking_headers(
-    external_agent_id: str | None, external_session_id: str | None
+    external_agent_id: str | None,
+    external_session_id: str | None,
+    project_id: str | None = None,
 ) -> dict[str, str]:
     """Build the usage-tracking headers for the WebSocket upgrade.
 
     Args:
         external_agent_id: Sent as ``X-SLNG-Agent-Id``. ``None`` sends nothing.
         external_session_id: Sent as ``X-SLNG-Session-Id``. ``None`` sends nothing.
+        project_id: Sent as ``X-SLNG-Project-Id``. ``None`` sends nothing.
 
     Returns:
-        Zero, one or two headers.
+        Zero to three headers.
 
     Raises:
         ValueError: If an ID fails the checks in ``_normalize_tracking_id``.
@@ -144,4 +147,6 @@ def tracking_headers(
         headers["X-SLNG-Session-Id"] = _normalize_tracking_id(
             external_session_id, "external_session_id"
         )
+    if project_id is not None:
+        headers["X-SLNG-Project-Id"] = _normalize_tracking_id(project_id, "project_id")
     return headers

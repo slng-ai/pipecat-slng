@@ -131,6 +131,7 @@ class SlngTTSService(WebsocketTTSService):
         provider_key: str | None = None,
         external_agent_id: str | None = None,
         external_session_id: str | None = None,
+        project_id: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         speed: float | None | NotGiven = NOT_GIVEN,
         pronunciation: dict[str, str] | None = None,
@@ -163,6 +164,9 @@ class SlngTTSService(WebsocketTTSService):
                 as the ``X-SLNG-Agent-Id`` header (max 128 chars).
             external_session_id: Optional tracking ID attached to usage events
                 as the ``X-SLNG-Session-Id`` header (max 128 chars).
+            project_id: Optional SLNG project UUID, sent as the
+                ``X-SLNG-Project-Id`` header. It selects the project that
+                usage is billed and limited under.
             language: Synthesis language. Defaults to ``Language.EN`` when not given.
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
             pronunciation: Optional session pronunciation dictionary reference,
@@ -178,7 +182,7 @@ class SlngTTSService(WebsocketTTSService):
         # Fail fast, before the parent service is built.
         resolved_world_part = WorldPart.resolve(world_part, base_url)
         self._tracking_headers = tracking_headers(
-            external_agent_id, external_session_id
+            external_agent_id, external_session_id, project_id
         )
 
         default_settings = self.Settings(

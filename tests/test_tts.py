@@ -222,7 +222,7 @@ async def test_ws_provider_key_header_absent_by_default(patch_ws):
 
 
 async def test_tracking_headers_sent(patch_ws):
-    """external_agent_id / external_session_id map to the X-SLNG-* headers, stripped."""
+    """external_agent_id / external_session_id / project_id map to the X-SLNG-* headers, stripped."""
     fake = patch_ws("pipecat_slng.tts", [json.dumps({"type": "ready"})])
     tts = SlngTTSService(
         world_part="us-east",
@@ -231,12 +231,14 @@ async def test_tracking_headers_sent(patch_ws):
         sample_rate=24000,
         external_agent_id=" agent-1 ",
         external_session_id=" call-9 ",
+        project_id=" proj-1 ",
     )
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
     assert fake.connect_headers["X-SLNG-Agent-Id"] == "agent-1"
     assert fake.connect_headers["X-SLNG-Session-Id"] == "call-9"
+    assert fake.connect_headers["X-SLNG-Project-Id"] == "proj-1"
 
 
 async def test_tracking_headers_absent_by_default(patch_ws):
