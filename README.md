@@ -137,8 +137,8 @@ call. The [full example](#full-example-with-usage-tracking) below does this.
 
 To bill and limit usage under one SLNG project, also pass `project_id`, the
 project's UUID. It is sent as the `X-SLNG-Project-Id` header on the same
-connections and is checked with the same rules. `None` (the default) sends no
-header.
+connections and is checked with the same rules. A value that is not a UUID
+raises `ValueError`. `None` (the default) sends no header.
 
 ### Optional TTS warm standby
 

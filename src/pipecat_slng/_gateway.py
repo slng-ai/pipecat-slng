@@ -11,6 +11,7 @@ routed between regions. See https://docs.slng.ai/models/catalog/by-region.
 """
 
 import re
+import uuid
 import warnings
 from enum import StrEnum
 from urllib.parse import quote, urlsplit
@@ -136,7 +137,8 @@ def tracking_headers(
         Zero to three headers.
 
     Raises:
-        ValueError: If an ID fails the checks in ``_normalize_tracking_id``.
+        ValueError: If an ID fails the checks in ``_normalize_tracking_id``,
+            or ``project_id`` is not a UUID.
     """
     headers: dict[str, str] = {}
     if external_agent_id is not None:
@@ -148,5 +150,10 @@ def tracking_headers(
             external_session_id, "external_session_id"
         )
     if project_id is not None:
-        headers["X-SLNG-Project-Id"] = _normalize_tracking_id(project_id, "project_id")
+        project_id = _normalize_tracking_id(project_id, "project_id")
+        try:
+            uuid.UUID(project_id)
+        except ValueError:
+            raise ValueError("project_id must be a UUID") from None
+        headers["X-SLNG-Project-Id"] = project_id
     return headers

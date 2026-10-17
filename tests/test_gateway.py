@@ -72,11 +72,19 @@ def test_tracking_headers_none_sends_nothing():
     assert tracking_headers("agent-1", None) == {"X-SLNG-Agent-Id": "agent-1"}
 
 
+PROJECT_ID = "3f2b6c1e-8a4d-4f7e-9b2a-1c5d7e9f0a12"
+
+
 def test_tracking_headers_project_id():
-    project_id = "3f2b6c1e-8a4d-4f7e-9b2a-1c5d7e9f0a12"
-    assert tracking_headers(None, None, f" {project_id} ") == {
-        "X-SLNG-Project-Id": project_id
+    assert tracking_headers(None, None, f" {PROJECT_ID} ") == {
+        "X-SLNG-Project-Id": PROJECT_ID
     }
+
+
+@pytest.mark.parametrize("value", ["proj-1", "my-project", PROJECT_ID[:-1]])
+def test_tracking_headers_reject_non_uuid_project_id(value):
+    with pytest.raises(ValueError, match="^project_id must be a UUID$"):
+        tracking_headers(None, None, value)
 
 
 @pytest.mark.parametrize(
@@ -108,3 +116,9 @@ def test_tracking_id_of_128_chars_is_accepted():
 def test_services_reject_bad_tracking_id(service):
     with pytest.raises(ValueError, match="external_session_id must not be empty"):
         service(api_key="test-key", world_part="in", external_session_id=" ")
+
+
+@pytest.mark.parametrize("service", [SlngSTTService, SlngTTSService])
+def test_services_reject_non_uuid_project_id(service):
+    with pytest.raises(ValueError, match="^project_id must be a UUID$"):
+        service(api_key="test-key", world_part="in", project_id="proj-1")

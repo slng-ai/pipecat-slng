@@ -166,7 +166,8 @@ class SlngTTSService(WebsocketTTSService):
                 as the ``X-SLNG-Session-Id`` header (max 128 chars).
             project_id: Optional SLNG project UUID, sent as the
                 ``X-SLNG-Project-Id`` header. It selects the project that
-                usage is billed and limited under.
+                usage is billed and limited under. A value that is not a UUID
+                raises ``ValueError``.
             language: Synthesis language. Defaults to ``Language.EN`` when not given.
             speed: Speech speed multiplier. ``None`` (default) keeps the server default.
             pronunciation: Optional session pronunciation dictionary reference,

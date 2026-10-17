@@ -12,7 +12,7 @@ to [Semantic Versioning](https://semver.org/).
   under. It is sent as the `X-SLNG-Project-Id` header on every WebSocket
   upgrade, including TTS reconnects and the warm standby socket. It is
   optional. `None` sends no header. It is checked with the same rules as the
-  agent and session ids.
+  agent and session ids, and a value that is not a UUID raises `ValueError`.
 
 ## [0.7.0] - 2026-10-15
 

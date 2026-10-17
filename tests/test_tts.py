@@ -231,14 +231,17 @@ async def test_tracking_headers_sent(patch_ws):
         sample_rate=24000,
         external_agent_id=" agent-1 ",
         external_session_id=" call-9 ",
-        project_id=" proj-1 ",
+        project_id=" 3f2b6c1e-8a4d-4f7e-9b2a-1c5d7e9f0a12 ",
     )
 
     await run_test(tts, frames_to_send=[SleepFrame(sleep=0.1)])
 
     assert fake.connect_headers["X-SLNG-Agent-Id"] == "agent-1"
     assert fake.connect_headers["X-SLNG-Session-Id"] == "call-9"
-    assert fake.connect_headers["X-SLNG-Project-Id"] == "proj-1"
+    assert (
+        fake.connect_headers["X-SLNG-Project-Id"]
+        == "3f2b6c1e-8a4d-4f7e-9b2a-1c5d7e9f0a12"
+    )
 
 
 async def test_tracking_headers_absent_by_default(patch_ws):
