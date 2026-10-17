@@ -81,6 +81,13 @@ def test_tracking_headers_project_id():
     }
 
 
+@pytest.mark.parametrize(
+    "value", [PROJECT_ID.upper(), PROJECT_ID.replace("-", ""), f"{{{PROJECT_ID}}}"]
+)
+def test_tracking_headers_send_canonical_project_id(value):
+    assert tracking_headers(None, None, value) == {"X-SLNG-Project-Id": PROJECT_ID}
+
+
 @pytest.mark.parametrize("value", ["proj-1", "my-project", PROJECT_ID[:-1]])
 def test_tracking_headers_reject_non_uuid_project_id(value):
     with pytest.raises(ValueError, match="^project_id must be a UUID$"):

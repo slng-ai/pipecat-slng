@@ -152,8 +152,8 @@ def tracking_headers(
     if project_id is not None:
         project_id = _normalize_tracking_id(project_id, "project_id")
         try:
-            uuid.UUID(project_id)
+            canonical = str(uuid.UUID(project_id))
         except ValueError:
             raise ValueError("project_id must be a UUID") from None
-        headers["X-SLNG-Project-Id"] = project_id
+        headers["X-SLNG-Project-Id"] = canonical
     return headers

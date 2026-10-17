@@ -118,8 +118,8 @@ class SlngSTTService(WebsocketSTTService):
                 as the ``X-SLNG-Session-Id`` header (max 128 chars).
             project_id: Optional SLNG project UUID, sent as the
                 ``X-SLNG-Project-Id`` header. It selects the project that
-                usage is billed and limited under. A value that is not a UUID
-                raises ``ValueError``.
+                usage is billed and limited under. It is sent in lowercase
+                hyphenated form. A value that is not a UUID raises ``ValueError``.
             language: Recognition language. When not given, none is sent and the
                 gateway applies the selected model's default language, defined
                 per model in the SLNG catalog: e.g. ``hi`` on
