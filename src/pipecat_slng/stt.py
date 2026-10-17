@@ -86,6 +86,7 @@ class SlngSTTService(WebsocketSTTService):
         provider_key: str | None = None,
         external_agent_id: str | None = None,
         external_session_id: str | None = None,
+        project_id: str | None = None,
         language: Language | NotGiven = NOT_GIVEN,
         enable_partials: bool | NotGiven = NOT_GIVEN,
         settings: Settings | None = None,
@@ -115,6 +116,10 @@ class SlngSTTService(WebsocketSTTService):
                 as the ``X-SLNG-Agent-Id`` header (max 128 chars).
             external_session_id: Optional tracking ID attached to usage events
                 as the ``X-SLNG-Session-Id`` header (max 128 chars).
+            project_id: Optional SLNG project UUID, sent as the
+                ``X-SLNG-Project-Id`` header. It selects the project that
+                usage is billed and limited under. It is sent in lowercase
+                hyphenated form. A value that is not a UUID raises ``ValueError``.
             language: Recognition language. When not given, none is sent and the
                 gateway applies the selected model's default language, defined
                 per model in the SLNG catalog: e.g. ``hi`` on
@@ -131,7 +136,7 @@ class SlngSTTService(WebsocketSTTService):
         # Fail fast, before the parent service is built.
         resolved_world_part = WorldPart.resolve(world_part, base_url)
         self._tracking_headers = tracking_headers(
-            external_agent_id, external_session_id
+            external_agent_id, external_session_id, project_id
         )
 
         default_settings = self.Settings(

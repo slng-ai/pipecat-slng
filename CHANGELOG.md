@@ -5,6 +5,15 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `project_id` argument on `SlngSTTService` and `SlngTTSService`. Pass your
+  SLNG project UUID to pick the project that usage is billed and limited
+  under. It is sent as the `X-SLNG-Project-Id` header on every WebSocket
+  upgrade, including TTS reconnects and the warm standby socket. It is
+  optional. `None` sends no header. It is checked with the same rules as the
+  agent and session ids, and a value that is not a UUID raises `ValueError`.
+
 ## [0.7.0] - 2026-10-15
 
 ### Added
